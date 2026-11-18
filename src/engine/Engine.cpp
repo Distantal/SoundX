@@ -1,0 +1,5206 @@
+#include "Engine.h"
+#include "BuiltInEffects.h"
+#include "BuiltInSampler.h"
+#if JUCE_WINDOWS
+#include <windows.h>
+#endif
+
+namespace sx
+{
+using namespace juce;
+
+//==============================================================================
+void PluginInstance::audioProcessorParameterChanged (AudioProcessor*, int index, float value)
+{
+    if (engine != nullptr && MessageManager::existsAndIsCurrentThread())
+        engine->parameterChanged (*this, index, value);
+}
+
+void PluginInstance::audioProcessorParameterChangeGestureBegin (AudioProcessor*, int index)
+{
+    if (engine != nullptr && MessageManager::existsAndIsCurrentThread())
+        engine->parameterGesture (*this, index, true);
+}
+
+void PluginInstance::audioProcessorParameterChangeGestureEnd (AudioProcessor*, int index)
+{
+    if (engine != nullptr && MessageManager::existsAndIsCurrentThread())
+        engine->parameterGesture (*this, index, false);
+}
+
+void PluginInstance::audioProcessorChanged (AudioProcessor* p, const ChangeDetails& details)
+{
+    if (p == nullptr || ! details.latencyChanged)
+        return;
+
+    // A plug-in may report its latency late (after prepareToPlay, after loading a preset, or
+    // after the sample rate changed). Keeping the old value would leave the track misaligned
+    // with the rest of the project, so the snapshot is rebuilt with the new chain latency.
+    int lat = 0;
+    try { lat = jmax (0, p->getLatencySamples()); } catch (...) { return; }
+
+    if (lat == latencySamples.load())
+        return;
+
+    latencySamples.store (lat);
+    if (engine != nullptr) engine->pluginLatencyChanged();
+}
+
+//==============================================================================
+static void trace (const String& s)
+{
+    static const String path = SystemStats::getEnvironmentVariable ("SOUNDX_TRACE", {});
+    if (path.isNotEmpty()) File (path).appendText (s + "\n");
+}
+
+// ARA inserts are on by default; SOUNDX_ARA_INSERTS=0 turns the ARA path off (the plug-in then runs
+// as a plain insert, which is also the fallback when a plug-in misbehaves in its ARA mode).
+static bool araInsertsEnabled()
+{
+    return SystemStats::getEnvironmentVariable ("SOUNDX_ARA_INSERTS", "1") != "0";
+}
+
+namespace
+{
+    void mixRegion (const AudioRegionSnap& r, TrackRuntime& rt, int64 segStart, int segOff, int segLen,
+                    const std::vector<TempoSegment>& tempo, double sr)
+    {
+        if (r.data == nullptr) return;
+        const int64 regStart = (int64) std::llround (tempomap::beatsToSeconds (tempo, r.startBeat) * sr);
+        const int64 regLen = (int64) std::llround (r.lengthSec * sr);
+        const int64 a = jmax (segStart, regStart);
+        const int64 b = jmin (segStart + segLen, regStart + regLen);
+        if (b <= a) return;
+
+        const auto& d = *r.data;
+        const int N = d.buffer.getNumSamples();
+        const int dch = d.buffer.getNumChannels();
+        const double ratio = d.sampleRate / sr;
+        // reversed clips read their source segment backwards; fades and automation stay where
+        // they are on the timeline, only the audio content is flipped
+        const double src0 = r.reversed
+            ? (r.offsetSec + r.lengthSec) * d.sampleRate - 1.0 - (double) (a - regStart) * ratio
+            : r.offsetSec * d.sampleRate + (double) (a - regStart) * ratio;
+        constexpr int fade = 96; // anti-click ramp when the clip has no explicit fades
+        const float* s0 = d.buffer.getReadPointer (0);
+        const float* s1 = d.buffer.getReadPointer (dch > 1 ? 1 : 0);
+        float* o0 = rt.buf.getWritePointer (0);
+        float* o1 = rt.buf.getWritePointer (1);
+        const int64 fadeInN = r.fadeIn > 0.0 ? jmax<int64> (1, (int64) std::llround (r.fadeIn * sr)) : 0;
+        const int64 fadeOutN = r.fadeOut > 0.0 ? jmax<int64> (1, (int64) std::llround (r.fadeOut * sr)) : 0;
+        const double baseGain = (double) r.gain;
+        const bool hasGainEnv = ! r.gainEnv.empty();
+        // clip-relative beat at the start / end of this segment (linear inside the block)
+        const double envBeatA = tempomap::secondsToBeats (tempo, (double) a / sr) - r.startBeat;
+        const double envBeatB = tempomap::secondsToBeats (tempo, (double) (b - 1) / sr) - r.startBeat;
+        const double envSpan = (double) jmax<int64> (1, b - a - 1);
+        size_t gi = 1;
+
+        //== fast path: constant gain ============================================================
+        // Most of a clip plays with a plain gain: no fade inside this segment, no crossfade,
+        // no drawn envelope. The per-sample envelope work (shape functions, decibel
+        // conversions, double-precision branches) then collapses into one multiply, which is
+        // what keeps long audio tracks cheap on the CPU.
+        {
+            const int64 fromStartA = a - regStart;
+            const int64 fromEndB = regStart + regLen - (b - 1);   // distance to the end at the last sample
+            const bool fadeInActive = fadeInN > 0 ? fromStartA < fadeInN : fromStartA < fade;
+            const bool fadeOutActive = fadeOutN > 0 ? fromEndB < fadeOutN : fromEndB < fade;
+            const double tsA = (double) fromStartA / sr;
+            const double tsB = (double) (b - 1 - regStart) / sr;
+            const bool xfadeActive = r.xfadeEnd > r.xfadeStart && tsB >= r.xfadeStart && tsA < r.xfadeEnd;
+            if (! fadeInActive && ! fadeOutActive && ! xfadeActive && ! hasGainEnv)
+            {
+                const float g = (float) baseGain;
+                const double step = r.reversed ? -ratio : ratio;
+                double sp = src0;
+                for (int64 i = a; i < b; ++i)
+                {
+                    const int i0 = (int) sp;
+                    if (i0 >= 0 && i0 < N)
+                    {
+                        const int i1 = jmin (i0 + 1, N - 1);
+                        const float fr = (float) (sp - (double) i0);
+                        const int o = segOff + (int) (i - segStart);
+                        o0[o] += (s0[i0] + (s0[i1] - s0[i0]) * fr) * g;
+                        o1[o] += (s1[i0] + (s1[i1] - s1[i0]) * fr) * g;
+                    }
+                    sp += step;
+                }
+                return;
+            }
+        }
+
+        for (int64 i = a; i < b; ++i)
+        {
+            const double sp = r.reversed ? src0 - (double) (i - a) * ratio
+                                         : src0 + (double) (i - a) * ratio;
+            const int i0 = (int) sp;
+            if (i0 < 0 || i0 >= N) continue;
+            const int i1 = jmin (i0 + 1, N - 1);
+            const float fr = (float) (sp - i0);
+
+            double env = baseGain;
+            const int64 fromStart = i - regStart, fromEnd = regStart + regLen - i;
+            if (fadeInN > 0)
+            {
+                if (fromStart < fadeInN)
+                {
+                    const double t = fromStart / (double) fadeInN;
+                    env *= fadeShape (r.fadeInCurve, t);   // the shape chosen on the clip
+                }
+            }
+            else if (fromStart < fade)
+                env *= (double) fromStart / (double) fade;
+
+            if (fadeOutN > 0)
+            {
+                if (fromEnd < fadeOutN)
+                {
+                    const double t = fromEnd / (double) fadeOutN;
+                    env *= fadeShape (r.fadeOutCurve, t);
+                }
+            }
+            else if (fromEnd < fade)
+                env *= (double) fromEnd / (double) fade;
+
+            // automatic equal-power crossfade with the neighbouring clip on this track
+            if (r.xfadeEnd > r.xfadeStart)
+            {
+                const double ts = (double) fromStart / sr;
+                if (ts >= r.xfadeStart && ts < r.xfadeEnd)
+                {
+                    const double t = (ts - r.xfadeStart) / (r.xfadeEnd - r.xfadeStart);
+                    if (r.xfadeCurve == 1)                       // linear
+                        env *= r.xfadeOut ? (1.0 - t) : t;
+                    else if (r.xfadeCurve == 2)                  // symmetric S-curve
+                    {
+                        const double s = t * t * (3.0 - 2.0 * t);
+                        env *= r.xfadeOut ? (1.0 - s) : s;
+                    }
+                    else                                         // equal power (cos / sin)
+                    {
+                        const double ang = 1.5707963267948966 * t;
+                        env *= r.xfadeOut ? std::cos (ang) : std::sin (ang);
+                    }
+                }
+            }
+
+            // clip gain envelope (drawn directly on the clip): value follows the drawn curve
+            if (hasGainEnv)
+            {
+                const double beat = envBeatA + (envBeatB - envBeatA) * ((double) (i - a) / envSpan);
+                while (gi < r.gainEnv.size() && r.gainEnv[gi].beat < beat) ++gi;
+                const auto& p1 = r.gainEnv[jmin (gi, r.gainEnv.size() - 1)];
+                const auto& p0 = r.gainEnv[gi - 1];
+                const double segSpan = p1.beat - p0.beat;
+                const double t = segSpan > 1.0e-9 ? jlimit (0.0, 1.0, (beat - p0.beat) / segSpan) : 1.0;
+                env *= Decibels::decibelsToGain ((double) (p0.db + (p1.db - p0.db) * (float) t));
+            }
+
+            const int o = segOff + (int) (i - segStart);
+            o0[o] += (s0[i0] + (s0[i1] - s0[i0]) * fr) * (float) env;
+            o1[o] += (s1[i0] + (s1[i1] - s1[i0]) * fr) * (float) env;
+        }
+    }
+
+    static constexpr int kPdcMask = TrackRuntime::kPdcCap - 1;
+
+    // Studio-style plug-in delay compensation: push stereo samples through a ring buffer,
+    // reading them back `delay` samples later. Stereo is stored interleaved.
+    void delayStereo (float* ring, int& wp, int delay, const float* in0, const float* in1,
+                      float* out0, float* out1, int n)
+    {
+        if (delay <= 0 || delay >= TrackRuntime::kPdcCap)
+        {
+            FloatVectorOperations::copy (out0, in0, n);
+            FloatVectorOperations::copy (out1, in1, n);
+            return;
+        }
+        for (int i = 0; i < n; ++i)
+        {
+            const int w = (wp + i) & kPdcMask;
+            ring[(size_t) w * 2] = in0[i];
+            ring[(size_t) w * 2 + 1] = in1[i];
+            const int r = (wp + i - delay) & kPdcMask;
+            out0[i] = ring[(size_t) r * 2];
+            out1[i] = ring[(size_t) r * 2 + 1];
+        }
+        wp = (wp + n) & kPdcMask;
+    }
+
+    // Delay-compensation ring for a track (dry path or pre-fader send path).
+    //
+    // The delay a track needs changes whenever a plug-in is added, removed, bypassed or starts
+    // reporting another latency. Moving the read pointer of a ring that already holds audio
+    // either repeats material (the read pointer jumps backwards - audible as a doubled note) or
+    // skips it. So a change clears the ring and fades the result in over ~1.5 ms instead.
+    void pdcDelay (std::vector<float>& ring, int& wp, int& appliedPad, int& fade,
+                   int pad, float* l, float* r, int n)
+    {
+        constexpr int fadeLen = 64;
+
+        pad = jlimit (0, TrackRuntime::kPdcCap - 1, pad);
+
+        if (pad != appliedPad)
+        {
+            // appliedPad < 0 means the ring is known to be all zeros already: a fresh
+            // TrackRuntime, or a transport-jump flush (both leave padApplied at -1), so the ring
+            // must not be zeroed a second time here. For a real latency change (or a re-prime
+            // after bypassing) the old content is dropped so it cannot be heard again.
+            if (appliedPad >= 0)
+                std::fill (ring.begin(), ring.end(), 0.0f);
+            wp = 0;
+            appliedPad = pad;
+            fade = fadeLen;
+        }
+
+        if (pad <= 0)
+        {
+            if (fade > 0)
+            {
+                for (int i = 0; i < n && fade > 0; ++i)
+                {
+                    const float g = 1.0f - (float) fade / (float) fadeLen;
+                    l[i] *= g;
+                    r[i] *= g;
+                    --fade;
+                }
+            }
+            return;
+        }
+
+        for (int i = 0; i < n; ++i)
+        {
+            const int w = (wp + i) & kPdcMask;
+            ring[(size_t) w * 2] = l[i];
+            ring[(size_t) w * 2 + 1] = r[i];
+            const int rd = (wp + i - pad) & kPdcMask;
+            float g = 1.0f;
+            if (fade > 0) { g = 1.0f - (float) fade / (float) fadeLen; --fade; }
+            l[i] = ring[(size_t) rd * 2] * g;
+            r[i] = ring[(size_t) rd * 2 + 1] * g;
+        }
+        wp = (wp + n) & kPdcMask;
+    }
+
+    void panGains (float vol, float pan, float& gl, float& gr)
+    {
+        gl = vol * (pan > 0.0f ? 1.0f - pan : 1.0f);
+        gr = vol * (pan < 0.0f ? 1.0f + pan : 1.0f);
+    }
+
+    void addNotesOff (MidiBuffer& mb, int ch, int offset)
+    {
+        mb.addEvent (MidiMessage::controllerEvent (ch, 64, 0), offset);
+        mb.addEvent (MidiMessage::allNotesOff (ch), offset);
+        // pitch bend is a centred controller: leaving it where a bend stopped would detune
+        // whatever plays next (the lane draws it resting in the middle, see controllerRestsAtDefault)
+        mb.addEvent (MidiMessage::pitchWheel (ch, controllerDefault (kCCPitchBend)), offset);
+    }
+
+    void processPlugin (PluginInstance& inst, TrackRuntime& rt, int n, MidiBuffer& midi,
+                        TrackRuntime* scSource = nullptr)
+    {
+        auto& p = *inst.proc;
+        const int nch = jlimit (2, TrackRuntime::kChannels, jmax (p.getTotalNumInputChannels(), p.getTotalNumOutputChannels()));
+        AudioBuffer<float> view (rt.buf.getArrayOfWritePointers(), nch, 0, n);
+        // hand the side-chain block to a built-in that can use one (the EQ's detector)
+        if (auto* sx = dynamic_cast<SxEffectBase*> (&p); sx != nullptr && sx->sidechainFeed != nullptr)
+        {
+            auto& feed = *sx->sidechainFeed;
+            const bool ok = scSource != nullptr && scSource->scLen > 0 && scSource->trackId != rt.trackId;
+            feed.valid.store (ok);
+            if (ok)
+            {
+                const int m = jmin (n, SxEffectBase::SidechainFeed::kMax);
+                FloatVectorOperations::copy (feed.l, scSource->scL, m);
+                FloatVectorOperations::copy (feed.r, scSource->scR, m);
+                feed.n = m;
+                feed.sourceTrack.store (scSource->trackId);
+            }
+            else
+            {
+                feed.n = 0;
+            }
+        }
+        try
+        {
+            if (inst.bypass.load() || inst.editorBypass.load())
+            {
+                if (! inst.isInstrument)
+                    p.processBlockBypassed (view, midi);
+                return;
+            }
+            p.processBlock (view, midi);
+        }
+        catch (...)
+        {
+            // A plug-in crashed while rendering: bypass it for the rest of this block
+            inst.bypass.store (true);
+        }
+        if (p.getTotalNumOutputChannels() == 1)
+            rt.buf.copyFrom (1, 0, rt.buf, 0, 0, n);
+    }
+}
+
+//==============================================================================
+namespace
+{
+    // one CPU relaxation instruction: lets a spinning thread step aside without a system call
+    inline void cpuRelax() noexcept
+    {
+       #if JUCE_WINDOWS
+        YieldProcessor();
+       #elif defined(__aarch64__) || defined(__arm__)
+        __asm__ __volatile__ ("yield");
+       #else
+        std::this_thread::yield();
+       #endif
+    }
+}
+
+RenderWorkerPool::~RenderWorkerPool() { stop(); }
+
+void RenderWorkerPool::start (int numberOfThreads)
+{
+    stop();
+    numberOfThreads = jlimit (1, kMaxThreads, numberOfThreads);
+    // lane 0 is the caller (the audio thread); the workers get fixed lanes 1..n. A worker never
+    // takes over another lane's work, which keeps each track's plug-ins on one thread.
+    laneCount.store (1, std::memory_order_relaxed);
+    for (int i = 0; i < numberOfThreads; ++i)
+    {
+        laneWork[(size_t) i].store (false, std::memory_order_relaxed);
+        laneWake[(size_t) i] = std::make_unique<juce::WaitableEvent> (false);
+    }
+    for (int i = 0; i < numberOfThreads; ++i)
+    {
+        try { threads.emplace_back ([this, lane = i + 1] { workerLoop (lane); }); }
+        catch (...) { break; }
+    }
+    laneCount.store ((int) threads.size() + 1, std::memory_order_release);
+}
+
+void RenderWorkerPool::stop()
+{
+    {
+        std::lock_guard<std::mutex> l (mutex);
+        stopping.store (true, std::memory_order_release);
+    }
+    // wake every worker, including the ones currently parked on their own event
+    for (auto& e : laneWake) if (e != nullptr) e->signal();
+    for (auto& t : threads) if (t.joinable()) t.join();
+    threads.clear();
+    stopping.store (false, std::memory_order_release);
+    for (auto& w : laneWork) w.store (false, std::memory_order_relaxed);
+    for (auto& e : laneWake) e.reset();
+    currentFn.store (nullptr, std::memory_order_relaxed);
+    currentContext.store (nullptr, std::memory_order_relaxed);
+    laneCount.store (1, std::memory_order_relaxed);
+    finishedWorkers.store (0);
+    itemCount.store (0);
+}
+
+void RenderWorkerPool::runTask (int count, TaskFn task, void* context)
+{
+    if (count <= 0 || task == nullptr) return;
+    if (threads.empty())
+    {
+        for (int i = 0; i < count; ++i) task (context, i);
+        return;
+    }
+
+    // stable while the pool runs (the pool is only restarted with the audio callback detached)
+    const int lanes = laneCount.load (std::memory_order_relaxed);
+    const int workers = (int) threads.size();
+    // Worker lane k renders items k, k + lanes, ... . Only lanes below `count` have any work:
+    // a level with two tracks signals one worker and leaves the rest asleep.
+    const int busy = jmin (workers, count - 1);
+    {
+        std::lock_guard<std::mutex> l (mutex);
+        currentFn.store (task, std::memory_order_relaxed);
+        currentContext.store (context, std::memory_order_relaxed);
+        itemCount.store (count, std::memory_order_relaxed);
+        finishedWorkers.store (0, std::memory_order_relaxed);
+        for (int i = 0; i < busy; ++i)
+        {
+            laneWork[(size_t) i].store (true, std::memory_order_release);
+            laneWake[(size_t) i]->signal();
+        }
+    }
+
+    // The audio thread takes part in the render as lane 0. Its items are 0, lanes, 2*lanes, ...
+    // and it is the thread that has to finish the block, so doing its share here removes one
+    // full hand-over from the critical path.
+    for (int i = 0; i < count; i += lanes)
+        task (context, i);
+
+    // Wait only for the lanes that were given work. A short spin covers the normal case (they
+    // were already spinning or wake within microseconds); a genuinely slow worker is waited for
+    // on the condition variable, which costs one context switch but no CPU while parked.
+    if (busy > 0)
+    {
+        for (int spin = 0; spin < 512; ++spin)
+        {
+            if (finishedWorkers.load (std::memory_order_acquire) >= busy) break;
+            cpuRelax();
+        }
+        if (finishedWorkers.load (std::memory_order_acquire) < busy)
+        {
+            std::unique_lock<std::mutex> l (mutex);
+            done.wait (l, [this, busy] { return finishedWorkers.load (std::memory_order_acquire) >= busy; });
+        }
+    }
+
+    std::lock_guard<std::mutex> l (mutex);
+    currentFn.store (nullptr, std::memory_order_relaxed);
+    currentContext.store (nullptr, std::memory_order_relaxed);
+    itemCount.store (0, std::memory_order_relaxed);
+}
+
+void RenderWorkerPool::workerLoop (int lane)
+{
+    Thread::setCurrentThreadName ("SoundX render");
+#if JUCE_WINDOWS
+    // hosted VST3s may use COM on their processing thread; a plain std::thread has no apartment
+    const HRESULT comResult = CoInitializeEx (nullptr, COINIT_MULTITHREADED);
+    // BELOW normal, not high: a full render pool at a higher priority than the message thread
+    // starves the UI (plug-in windows paint black, the playhead repaints late) and every
+    // plug-in's own background threads (Waves / Ozone misbehave). The workers still answer
+    // within microseconds while they spin, and the audio device thread ranks above them.
+    SetThreadPriority (GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+    const int idx = jlimit (0, kMaxThreads - 1, lane - 1);
+    int spinBudget = kSpinCycles;
+    for (;;)
+    {
+        // spin briefly: the next block usually arrives within a few hundred microseconds, and a
+        // kernel wait + wake-up would be more expensive (and less predictable) than a pause loop.
+        // The spin is deliberately short; a surplus worker (or an idle project) sleeps instead of
+        // keeping a core busy between blocks.
+        bool haveWork = false;
+        for (int spin = 0; spin < spinBudget; ++spin)
+        {
+            if (stopping.load (std::memory_order_acquire)) goto done;
+            if (laneWork[(size_t) idx].load (std::memory_order_acquire)) { haveWork = true; break; }
+            cpuRelax();
+        }
+        if (! haveWork)
+        {
+            laneWake[(size_t) idx]->wait();
+            if (stopping.load (std::memory_order_acquire)) goto done;
+            if (! laneWork[(size_t) idx].load (std::memory_order_acquire)) continue;
+        }
+        // Clear the flag before acknowledging: once the caller sees the ack it may publish the
+        // next job for this lane, and the flag must not still belong to the previous one.
+        if (! laneWork[(size_t) idx].exchange (false, std::memory_order_acq_rel)) continue;
+
+        auto fn = currentFn.load (std::memory_order_relaxed);
+        void* context = currentContext.load (std::memory_order_relaxed);
+        const int count = itemCount.load (std::memory_order_relaxed);
+        const int lanes = laneCount.load (std::memory_order_relaxed);
+
+        bool didWork = false;
+        for (int i = lane; i < count; i += lanes)
+        {
+            if (fn != nullptr)
+            {
+                didWork = true;
+                // A render fault must crash / be debugged, never be swallowed: hiding an access
+                // violation here would leave the audio thread waiting on a worker that is dead
+                // and turn a crash into corrupted audio and inconsistent state.
+                fn (context, i);
+            }
+        }
+        spinBudget = didWork ? kSpinCycles : jmax (kMinSpinCycles, spinBudget / 2);
+
+        // The increment must happen while holding the mutex: the audio thread checks the counter
+        // and then waits on `done`; a notification that is not ordered against that wait can be
+        // lost, which would leave the audio callback blocked forever (the app appears frozen).
+        {
+            std::lock_guard<std::mutex> l (mutex);
+            finishedWorkers.fetch_add (1, std::memory_order_acq_rel);
+        }
+        done.notify_all();
+    }
+
+done:
+#if JUCE_WINDOWS
+    if (SUCCEEDED (comResult)) CoUninitialize();
+#endif
+}
+
+//==============================================================================
+Engine::Engine (Project& p, PluginManager& pm) : project (p), plugins (pm)
+{
+    formats.registerBasicFormats();
+    project.formats = &formats;
+    project.addListener (this);
+    project.capturePluginStates = [this] { captureStates(); };
+
+    // plug-in values are part of the undo stack: the model cannot see the instances, so it asks
+    // the engine for their parameter values (and the opaque state it is about to throw away)
+    project.capturePluginParams = [this] (std::map<int64, std::vector<float>>& out) { captureParams (out); };
+    project.capturePluginStatesFor = [this] (const std::set<int64>& uids, std::map<int64, MemoryBlock>& out)
+    {
+        captureStatesFor (uids, out);
+    };
+    project.applyPluginParams = [this] (const std::map<int64, std::vector<float>>& values) { applyParams (values); };
+    midiLearnOn.store (! project.midiMappings.empty(), std::memory_order_release);
+
+    writerThread.startThread();
+    previewThread.startThread();
+    metroDelayLine.assign ((size_t) TrackRuntime::kPdcCap * 2, 0.0f);
+    masterDelayLine.assign ((size_t) TrackRuntime::kPdcCap * 2, 0.0f);
+    lastTempo = project.tempo;
+    stoppedSinceMs.store (Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+    startTimerHz (30);
+
+    // The user may have picked a fixed core count (View > Multi-core Rendering). 0 = auto.
+    renderCoresSetting = 0;
+    if (auto* props = plugins.properties())
+    {
+        renderCoresSetting = jlimit (0, 16, props->getIntValue ("renderCores", 0));
+        // an exclusive driver (ASIO / ASIO4ALL) keeps every other application silent for as long
+        // as SoundX is open: while the transport is stopped the device is released, and the next
+        // play / record / preview re-opens it (View > Release Audio Device When Idle)
+        releaseIdleDevice.store (props->getBoolValue ("releaseIdleAudioDevice", true), std::memory_order_release);
+    }
+    multiCore.store (renderCoresSetting != 1, std::memory_order_release);
+    startRenderPool();
+}
+
+int Engine::autoRenderCores()
+{
+    // Physical cores, not logical processors: an 8-thread laptop has 4 cores, and putting 7
+    // workers on it makes the audio thread compete with its own helpers (random dropouts).
+    int cores = SystemStats::getNumPhysicalCpus();
+    if (cores <= 0) cores = jmax (1, (int) SystemStats::getNumCpus() / 2);
+    return jlimit (1, 16, cores);
+}
+
+void Engine::startRenderPool()
+{
+    const int wantedCores = renderCoresSetting > 0 ? renderCoresSetting : autoRenderCores();
+    renderWorkers = wantedCores <= 1 ? 0 : jlimit (1, 15, wantedCores - 1);
+    if (renderWorkers > 0)
+    {
+        renderPool.start (renderWorkers);
+        renderWorkers = renderPool.threadCount();   // thread creation may have failed
+    }
+}
+
+void Engine::setRenderCores (int cores)
+{
+    cores = jlimit (0, 16, cores);
+    renderCoresSetting = cores;
+    if (auto* props = plugins.properties())
+    {
+        props->setValue ("renderCores", cores);
+        props->saveIfNeeded();
+    }
+    const bool wanted = cores != 1;
+    multiCore.store (wanted, std::memory_order_release);
+
+    const int wantedCores = cores > 0 ? cores : autoRenderCores();
+    const int wantedWorkers = wantedCores <= 1 ? 0 : jlimit (1, 15, wantedCores - 1);
+    if (wantedWorkers == renderWorkers) return;
+    // an offline export is rendering through this pool right now: keep it running and apply the
+    // new count on the next start (the progress window blocks the menus anyway)
+    if (exporting.load()) return;
+
+    // restart the pool while the device is not calling us: a worker must never run while its
+    // thread object is replaced
+    const bool deviceRunning = deviceManager.getCurrentAudioDevice() != nullptr;
+    if (deviceRunning) deviceManager.removeAudioCallback (this);
+    renderPool.stop();
+    renderWorkers = wantedWorkers;
+    if (renderWorkers > 0)
+    {
+        renderPool.start (renderWorkers);
+        renderWorkers = renderPool.threadCount();   // thread creation may have failed
+    }
+    if (deviceRunning) deviceManager.addAudioCallback (this);
+}
+
+Engine::~Engine()
+{
+    stopTimer();
+    cancelPendingUpdate();
+    // the idle-release helper must be gone before the device manager is torn down
+    deviceClosePending.store (false, std::memory_order_release);
+    if (deviceCloseThread.joinable()) deviceCloseThread.join();
+    // an in-flight async reopen (openDeviceAsync) must be done before the teardown as well
+    deviceOpenPending.store (false, std::memory_order_release);
+    if (deviceOpenThread.joinable()) deviceOpenThread.join();
+    // the preview player must go before the device stops calling us
+    stopPreview();
+    previewThread.stopThread (2000);
+    if (auto* props = plugins.properties())
+        if (auto xml = deviceManager.createStateXml())
+            props->setValue ("audioDeviceState", xml.get());
+    deviceManager.removeMidiInputDeviceCallback ({}, this);
+    deviceManager.removeAudioCallback (this);
+    project.removeListener (this);
+    project.capturePluginStates = nullptr;
+    {
+        SpinLock::ScopedLockType l (snapLock);
+        pending.reset();
+        audioSnap.store (nullptr, std::memory_order_release);
+    }
+    editSnap.reset();
+    for (auto& [uid, inst] : instances)
+    {
+        if (onSlotRemoved) onSlotRemoved (uid);
+        try { inst.reset(); } catch (...) {}
+    }
+    instances.clear();
+    runtimes.clear();
+    writerThread.stopThread (2000);
+}
+
+String Engine::initialiseAudio()
+{
+    std::unique_ptr<XmlElement> saved;
+    if (auto* props = plugins.properties())
+        saved = props->getXmlValue ("audioDeviceState");
+
+    auto err = deviceManager.initialise (2, 2, saved.get(), true);
+    syncAll();
+    deviceManager.addAudioCallback (this);
+    deviceManager.addMidiInputDeviceCallback ({}, this);
+    for (auto& d : MidiInput::getAvailableDevices())
+        deviceManager.setMidiInputDeviceEnabled (d.identifier, true);
+    return err;
+}
+
+//==============================================================================
+//== idle device release
+// An exclusive driver (ASIO / ASIO4ALL) keeps every other application silent for as long as
+// SoundX is open. While nothing needs the device it is closed here; the next play / record /
+// preview / realtime export re-opens it (and the audio settings dialog holds it open).
+
+bool Engine::deviceIsBusy() const
+{
+    if (exporting.load (std::memory_order_acquire)) return true;   // offline render owns the callback
+    if (playing.load (std::memory_order_acquire)) return true;
+    if (recording.load (std::memory_order_acquire)) return true;
+    if (previewOn.load (std::memory_order_acquire)) return true;
+    if (rtCapture.active.load (std::memory_order_acquire)) return true;
+    if (keepDeviceOpen.load (std::memory_order_acquire)) return true;
+    if (pianoRollAuditioning.load (std::memory_order_acquire)) return true;
+    if (! auditions.empty()) return true;             // sample auditioning needs the voices
+    // a just-played piano / musical-typing note: keep the driver open across the gaps between
+    // notes instead of closing it and reopening it (ASIO reopen) for every phrase
+    const double lastLive = lastLiveMidiMs.load (std::memory_order_relaxed);
+    if (liveNotesHeld.load (std::memory_order_relaxed) > 0) return true;
+    if (lastLive > 0.0 && Time::getMillisecondCounterHiRes() - lastLive < 15000.0) return true;
+    for (auto& t : project.tracks)
+        if (t != nullptr && (t->arm || t->monitor)) return true;
+    return false;
+}
+
+void Engine::releaseDeviceIfIdle()
+{
+    if (! releaseIdleDevice.load (std::memory_order_acquire)) return;
+    if (deviceManager.getCurrentAudioDevice() == nullptr) return;
+    if (deviceIsBusy()) { deviceIdleSinceMs = 0; return; }
+
+    const auto now = (juce::int64) juce::Time::getMillisecondCounterHiRes();
+    if (deviceIdleSinceMs == 0) { deviceIdleSinceMs = now; return; }
+    if (now - deviceIdleSinceMs < 8000) return;       // keep it for a moment of stopped time
+    deviceIdleSinceMs = 0;
+
+    // closing a driver (ASIO teardown) can block the caller for a moment: run it on a helper
+    // thread so it never collides with a plug-in window opening on the message thread
+    if (! deviceClosePending.exchange (true))
+    {
+        if (deviceCloseThread.joinable()) deviceCloseThread.join();
+        deviceCloseThread = std::thread ([this]
+        {
+            const ScopedLock sl (deviceToggleLock);
+            if (! deviceClosePending.exchange (false)) return;
+            if (deviceIsBusy()) return;               // play / record / preview started meanwhile
+            deviceReleased = true;
+            deviceManager.removeAudioCallback (this);
+            deviceManager.closeAudioDevice();         // hands the driver back to the system
+        });
+    }
+}
+
+void Engine::ensureDeviceOpen()
+{
+    deviceIdleSinceMs = 0;
+    deviceClosePending.store (false, std::memory_order_release);   // a pending close is cancelled
+    const ScopedLock sl (deviceToggleLock);           // never race the closing helper thread
+    if (deviceManager.getCurrentAudioDevice() != nullptr) return;
+    // the plug-ins are still prepared from when the device was closed: skip the re-prepare if
+    // it comes back at the same rate (audioDeviceAboutToStart double checks)
+    skipNextDevicePrepare.store (lastPreparedRate > 0, std::memory_order_release);
+    deviceManager.restartLastAudioDevice();
+    deviceManager.addAudioCallback (this);
+    deviceReleased = false;
+    if (deviceManager.getCurrentAudioDevice() == nullptr && onError)
+        onError (TRANS ("The audio device could not be re-opened. Check Audio / MIDI Settings."));
+}
+
+void Engine::setReleaseIdleDevice (bool on)
+{
+    releaseIdleDevice.store (on, std::memory_order_release);
+    if (auto* props = plugins.properties()) props->setValue ("releaseIdleAudioDevice", on);
+    deviceIdleSinceMs = 0;
+    if (! on) ensureDeviceOpen();                     // switching it off brings the device back
+}
+
+void Engine::parkLiveNote (const MidiMessage& m)
+{
+    const ScopedLock sl (parkedLiveLock);
+    parkedLiveNotes.push_back (m);
+}
+
+void Engine::flushParkedLiveNotes()
+{
+    std::vector<MidiMessage> notes;
+    { const ScopedLock sl (parkedLiveLock); notes.swap (parkedLiveNotes); }
+    for (auto& m : notes) sendLiveMessage (m);
+}
+
+void Engine::openDeviceAsync()
+{
+    if (deviceManager.getCurrentAudioDevice() != nullptr) return;
+    if (deviceOpenPending.exchange (true)) return;    // a reopen is already running
+
+    if (deviceOpenThread.joinable()) deviceOpenThread.join();   // finished long ago, returns at once
+    deviceOpenThread = std::thread ([this]
+    {
+        deviceIdleSinceMs = 0;
+        deviceClosePending.store (false, std::memory_order_release);   // cancel a pending close
+        const ScopedLock sl (deviceToggleLock);       // never race the closing helper thread
+        // the plug-ins are still prepared from when the device was closed: skip the re-prepare
+        // if it comes back at the same rate (audioDeviceAboutToStart double checks)
+        skipNextDevicePrepare.store (lastPreparedRate > 0, std::memory_order_release);
+        deviceManager.restartLastAudioDevice();
+        deviceManager.addAudioCallback (this);        // audioDeviceAboutToStart flushes the parked notes
+        deviceReleased = false;
+        if (deviceManager.getCurrentAudioDevice() == nullptr && onError)
+            onError (TRANS ("The audio device could not be re-opened. Check Audio / MIDI Settings."));
+        deviceOpenPending.store (false, std::memory_order_release);
+    });
+}
+
+//==============================================================================
+void Engine::audioDeviceAboutToStart (AudioIODevice* d)
+{
+    sampleRate = d->getCurrentSampleRate();
+    deviceBlock = d->getCurrentBufferSizeSamples();
+    liveCollector.reset (sampleRate);
+    // a free-standing offline render restores its plug-ins itself and re-attaches the callback
+    // here; re-preparing every plug-in of the project again would make freezing a big session
+    // slow. The same flag also rides along when the idle release re-opens the device - but a
+    // device that came back at a different rate needs a real re-prepare.
+    const bool stillPrepared = skipNextDevicePrepare.exchange (false)
+                               && lastPreparedRate > 0
+                               && std::abs (sampleRate - (double) lastPreparedRate) < 0.5;
+    if (! stillPrepared) prepareAll (sampleRate, TrackRuntime::kMaxBlock, false);
+    // notes parked while the idle release had the device closed (piano roll audition, musical
+    // typing) go out now, after reset() cleared the stale queue - in their original order
+    flushParkedLiveNotes();
+}
+
+void Engine::audioDeviceStopped() {}
+
+void Engine::prepareAll (double sr, int block, bool nonRealtime)
+{
+    for (auto& [uid, inst] : instances)
+    {
+        auto& p = *inst->proc;
+        p.releaseResources();
+        p.setNonRealtime (nonRealtime);
+        p.setRateAndBufferSizeDetails (sr, block);
+        p.prepareToPlay (sr, block);
+        int lat = 0;
+        try { lat = jmax (0, p.getLatencySamples()); } catch (...) {}
+        inst->latencySamples.store (lat);
+        trace ("latency \"" + inst->name + "\" = " + String (lat) + " samples");
+    }
+    lastPreparedRate = (int) std::lround (sr);
+}
+
+//==============================================================================
+double Engine::getPositionBeats() const
+{
+    return project.samplesToBeats (posSamples.load(), sampleRate);
+}
+
+void Engine::setPositionBeats (double beats)
+{
+    // a direct transport jump (stop / loop / project load / tests) is immediate
+    seekRequested.store (false, std::memory_order_release);
+    seekFadeIn.store (false, std::memory_order_release);
+    posSamples.store (project.beatToSamples (beats, sampleRate));
+    flushNotes = true;
+    requestPdcFlush();                  // the render thread drops the old-position ring content
+}
+
+void Engine::seekToBeats (double beats)
+{
+    if (! playing.load() || recording.load())
+    {
+        setPositionBeats (beats);
+        return;
+    }
+
+    seekTargetSamples.store (project.beatToSamples (beats, sampleRate), std::memory_order_release);
+    seekRequested.store (true, std::memory_order_release);
+    // Do not flush notes yet: the old block must keep playing while its tail fades out. The
+    // target block starts with a note flush and a fade-in. The PDC flush is requested when the
+    // jump is actually applied in the audio callback (seekNow), not here: flushing now would
+    // dip the still-fading-out block, and the ring would be refilled with old audio anyway.
+}
+
+void Engine::play()
+{
+    if (playing.load()) return;
+    ensureDeviceOpen();                  // the idle release may have closed the device
+    flushNotes = true;
+    requestPdcFlush();                   // never replay the ring content from before the stop
+    stoppedSinceMs.store (0.0, std::memory_order_relaxed);
+    playing = true;
+}
+
+void Engine::stop()
+{
+    if (recording.load()) finishRecording();
+    playing = false;
+    stoppedSinceMs.store (Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+    seekRequested.store (false, std::memory_order_release);
+    seekFadeIn.store (false, std::memory_order_release);
+    flushNotes = true;
+    requestPdcFlush();                   // the next play starts from a clean PDC state
+    if (posSamples.load() < 0) posSamples = 0;
+}
+
+void Engine::record()
+{
+    if (recording.load()) { stop(); return; }
+
+    ensureDeviceOpen();                  // input channels are read from the device below
+
+    int64 pos = jmax<int64> (0, posSamples.load());
+
+    std::vector<std::unique_ptr<Recorder>> recs;
+    midiRecTracks.clear();
+
+    bool anyArmed = false;
+    for (auto& t : project.tracks) if (t->arm) anyArmed = true;
+
+    for (auto& t : project.tracks)
+    {
+        const bool target = t->arm || (! anyArmed && t->id == selectedTrack.load() && t->type == TrackType::Instrument);
+        if (! target) continue;
+
+        if (t->type == TrackType::Instrument)
+        {
+            midiRecTracks.push_back (t->id);
+        }
+        else
+        {
+            auto* dev = deviceManager.getCurrentAudioDevice();
+            const int numIn = dev != nullptr ? dev->getActiveInputChannels().countNumberOfSetBits() : 0;
+            if (numIn <= 0) { if (onError) onError (TRANS ("No audio input channels are active. Check Audio Settings.")); return; }
+
+            auto r = std::make_unique<Recorder>();
+            r->trackId = t->id;
+            r->numChannels = t->inputMono ? 1 : 2;
+            r->firstChannel = jlimit (0, jmax (0, numIn - r->numChannels), t->inputChannel);
+            if (r->firstChannel + r->numChannels > numIn) r->numChannels = 1;
+
+            auto folder = recordingFolder();
+            folder.createDirectory();
+            r->file = folder.getNonexistentChildFile (File::createLegalFileName (t->name) + " take", ".wav");
+
+            WavAudioFormat wav;
+            auto* stream = new FileOutputStream (r->file);
+            if (! stream->openedOk()) { delete stream; if (onError) onError (TRANS ("Could not create recording file.")); return; }
+            auto* writer = wav.createWriterFor (stream, sampleRate, (unsigned int) r->numChannels, 24, {}, 0);
+            if (writer == nullptr) { delete stream; if (onError) onError (TRANS ("Could not create recording file.")); return; }
+            r->writer.reset (new AudioFormatWriter::ThreadedWriter (writer, writerThread, 65536));
+            recs.push_back (std::move (r));
+        }
+    }
+
+    if (recs.empty() && midiRecTracks.empty())
+    {
+        if (onError) onError (TRANS ("Arm a track for recording first (R button on the track header)."));
+        return;
+    }
+
+    recordFrom = pos;
+    recordStartBeat = project.samplesToBeats (pos, sampleRate);
+    recEvents.clear();
+    recFifo.reset();
+    // drop controller / note messages that were still queued from before the punch-in, so a stale
+    // key press from earlier playing cannot turn up as a phantom note in the take
+    liveCollector.reset (sampleRate > 0.0 ? sampleRate : 44100.0);
+    {
+        SpinLock::ScopedLockType l (recLock);
+        recorders = std::move (recs);
+    }
+
+    int64 startPos = pos;
+    if (project.countInBars > 0)
+    {
+        // step back over the count-in bars using the tempo map (meter-aware)
+        double b = recordStartBeat;
+        for (int i = 0; i < project.countInBars; ++i)
+            b = tempomap::barStartAtOrBefore (project.tempo, b - 1.0e-4);
+        startPos = project.beatToSamples (b, sampleRate);
+    }
+
+    posSamples = startPos;
+    flushNotes = true;
+    midiRecording = ! midiRecTracks.empty();
+    recording = true;
+    playing = true;
+    stoppedSinceMs.store (0.0, std::memory_order_relaxed);
+    requestPdcFlush();             // recording starts the transport: same clean PDC state as play()
+
+    // loop recording: remember the cycle so the take can be split back into one clip per pass
+    recLooping = project.loopOn && project.loopEnd > project.loopStart + 1.0e-6;
+    recLoopStartBeat = project.loopStart;
+    recLoopEndBeat = project.loopEnd;
+    recLoopPassSamples = recLooping
+        ? project.beatToSamples (recLoopEndBeat, sampleRate) - project.beatToSamples (recLoopStartBeat, sampleRate)
+        : 0;
+}
+
+File Engine::getCacheFolder()
+{
+    // a folder picked by the user wins over the default session folder in the temp directory
+    if (recordBaseDir != File())
+    {
+        recordBaseDir.createDirectory();
+        return recordBaseDir;
+    }
+    if (sessionRecordDir == File())
+        sessionRecordDir = File::getSpecialLocation (File::tempDirectory)
+                              .getChildFile ("SoundX")
+                              .getChildFile ("Cache " + Time::getCurrentTime().formatted ("%Y%m%d-%H%M%S"));
+    sessionRecordDir.createDirectory();
+    return sessionRecordDir;
+}
+
+File Engine::recordingFolder()
+{
+    if (project.file.existsAsFile())
+        return project.file.getParentDirectory().getChildFile ("Audio Files");
+
+    // unsaved project: takes live in the cache folder until the project is saved, at which point
+    // Project::collectAudioFiles() moves them next to the project file
+    return getCacheFolder();
+}
+
+void Engine::feedRecorders (const float* const* inputs, int numIn, int n, int64 pos)
+{
+    SpinLock::ScopedTryLockType l (recLock);
+    if (! l.isLocked()) return;
+
+    const int skip = (int) jlimit<int64> (0, n, recordFrom - pos);
+    if (skip >= n) return;
+
+    for (auto& r : recorders)
+    {
+        if (r->writer == nullptr) continue;
+        const float* ptrs[2] = { nullptr, nullptr };
+        for (int c = 0; c < r->numChannels; ++c)
+        {
+            const int ch = r->firstChannel + c;
+            ptrs[c] = ch < numIn && inputs[ch] != nullptr ? inputs[ch] + skip : nullptr;
+        }
+        static const float zeros[TrackRuntime::kMaxBlock] = {};
+        for (int c = 0; c < r->numChannels; ++c)
+            if (ptrs[c] == nullptr) ptrs[c] = zeros;
+        r->writer->write (ptrs, n - skip);
+        r->written += n - skip;
+    }
+}
+
+//==============================================================================
+void Engine::finishRecording()
+{
+    recording = false;
+    midiRecording = false;
+
+    const int64 stopPos = posSamples.load();
+
+    std::vector<std::unique_ptr<Recorder>> done;
+    {
+        SpinLock::ScopedLockType l (recLock);
+        done.swap (recorders);
+    }
+
+    // drain remaining MIDI events
+    {
+        const auto scope = recFifo.read (recFifo.getNumReady());
+        for (int i = 0; i < scope.blockSize1; ++i) recEvents.push_back (recFifoData[(size_t) (scope.startIndex1 + i)]);
+        for (int i = 0; i < scope.blockSize2; ++i) recEvents.push_back (recFifoData[(size_t) (scope.startIndex2 + i)]);
+    }
+
+    bool changed = false;
+    int num = 4, den = 4;
+    project.meterAt (recordStartBeat, num, den);
+    const double bw = num * 4.0 / den;
+    int lat = 0;
+    if (auto* dev = deviceManager.getCurrentAudioDevice())
+        lat = dev->getInputLatencyInSamples() + dev->getOutputLatencyInSamples();
+    lat += jmax (0, pdcTotalSamples.load());   // align with the latency-compensated playback path
+
+    bool checkpointed = false;
+    auto cp = [&] { if (! checkpointed) { project.checkpoint(); checkpointed = true; } };
+
+    for (auto& r : done)
+    {
+        r->writer.reset(); // the destructor drains the pending buffer to disk
+        if (r->written <= 0) { r->file.deleteFile(); continue; }
+
+        auto data = project.pool.load (r->file, formats);
+        auto* t = project.findTrack (r->trackId);
+        if (data == nullptr || t == nullptr) continue;
+
+        cp();
+        const double latSec = jmin ((double) lat / sampleRate, data->lengthSeconds() * 0.5);
+        const double recordStartBeat = project.samplesToBeats (recordFrom, sampleRate);
+
+        // a loop recording becomes one take per pass instead of a single clip running over the cycle
+        std::vector<LoopTakeSegment> passes;
+        if (project.takeRecording && recLooping && recLoopPassSamples > 0)
+        {
+            const int64 tillEnd = jmax<int64> (0, project.beatToSamples (recLoopEndBeat, sampleRate) - recordFrom);
+            passes = splitLoopRecording (r->written, tillEnd, recLoopPassSamples, recordStartBeat, recLoopStartBeat);
+            if (passes.size() < 2) passes.clear();
+        }
+
+        if (passes.empty())
+        {
+            AudioClip c;
+            c.id = project.newId();
+            c.name = r->file.getFileNameWithoutExtension();
+            c.file = r->file;
+            c.data = data;
+            c.start = recordStartBeat;
+            c.offsetSec = latSec;
+            c.lengthSec = jmax (0.05, data->lengthSeconds() - latSec);
+            t->audioClips.push_back (std::move (c));
+        }
+        else
+        {
+            for (size_t i = 0; i < passes.size(); ++i)
+            {
+                auto& p = passes[i];
+                AudioClip c;
+                c.id = project.newId();
+                c.name = r->file.getFileNameWithoutExtension() + " " + String ((int) i + 1);
+                c.file = r->file;
+                c.data = data;
+                c.start = p.startBeat;
+                const double skip = (i == 0 ? latSec : 0.0);       // the input latency belongs to pass 1
+                c.offsetSec = (double) p.startSample / sampleRate + skip;
+                c.lengthSec = jmax (0.05, (double) p.lengthSamples / sampleRate - skip);
+                t->audioClips.push_back (std::move (c));
+            }
+        }
+        changed = true;
+        // recording over an existing clip keeps it as the previous take of this stack
+        project.groupTakes (*t, false);
+    }
+
+    for (int tid : midiRecTracks)
+    {
+        auto* t = project.findTrack (tid);
+        if (t == nullptr || recEvents.empty()) continue;
+
+        const double clipStart = tempomap::barStartAtOrBefore (project.tempo, recordStartBeat);
+        const double stopBeat = jmax (recordStartBeat, project.samplesToBeats (stopPos, sampleRate));
+        MidiClip c;
+        c.id = project.newId();
+        c.name = t->name;
+        c.start = clipStart;
+        c.length = jmax (bw, std::ceil ((stopBeat - clipStart) / bw - 1.0e-6) * bw);
+
+        std::map<int, std::pair<double, int>> held; // pitch -> start, velocity
+        std::map<int, int> lastCC;
+        for (auto& e : recEvents)
+        {
+            if (e.pos < recordFrom) continue;
+            const double beat = project.samplesToBeats (e.pos, sampleRate) - clipStart;
+            MidiMessage m (e.data[0], e.data[1], e.data[2], 0.0);
+            if (m.isNoteOn())
+            {
+                if (held.count (m.getNoteNumber()) == 0)
+                    held[m.getNoteNumber()] = { beat, m.getVelocity() };
+            }
+            else if (m.isNoteOff())
+            {
+                auto it = held.find (m.getNoteNumber());
+                if (it != held.end())
+                {
+                    Note n;
+                    n.id = project.newId(); n.pitch = it->first; n.start = it->second.first;
+                    n.length = jmax (1.0 / 64.0, beat - it->second.first); n.velocity = it->second.second;
+                    c.notes.push_back (n);
+                    held.erase (it);
+                }
+            }
+            else
+            {
+                int cc = -1, v = 0;
+                if (m.isController()) { cc = m.getControllerNumber(); v = m.getControllerValue(); }
+                else if (m.isPitchWheel()) { cc = kCCPitchBend; v = m.getPitchWheelValue(); }
+                else if (m.isChannelPressure()) { cc = kCCAftertouch; v = m.getChannelPressureValue(); }
+                if (cc >= 0 && cc != 123 && cc != 120)
+                {
+                    auto it = lastCC.find (cc);
+                    if (it == lastCC.end() || it->second != v)
+                    {
+                        lastCC[cc] = v;
+                        CCPoint p; p.id = project.newId(); p.cc = cc; p.beat = beat; p.value = v;
+                        c.ccs.push_back (p);
+                    }
+                }
+            }
+        }
+        for (auto& [pitch, st] : held)
+        {
+            Note n;
+            n.id = project.newId(); n.pitch = pitch; n.start = st.first;
+            n.length = jmax (1.0 / 64.0, (stopBeat - clipStart) - st.first); n.velocity = st.second;
+            c.notes.push_back (n);
+        }
+
+        // record quantize: snap what was played onto the chosen grid (lengths are left alone so the
+        // take keeps its phrasing; a note never shrinks below a 128th)
+        if (project.recordQuantize > 0.0) quantizeRecordedNotes (c.notes, project.recordQuantize);
+
+        if (! c.notes.empty() || ! c.ccs.empty())
+        {
+            cp();
+            t->midiClips.push_back (std::move (c));
+            changed = true;
+            // the fresh take becomes the active one, the pass it was recorded over keeps its data
+            project.groupTakes (*t, true);
+        }
+    }
+
+    recEvents.clear();
+    if (changed) project.sendContentChanged();
+}
+
+//==============================================================================
+void Engine::readTrackPeaks (int trackId, float& l, float& r)
+{
+    l = r = 0.0f;
+    auto it = runtimes.find (trackId);
+    if (it == runtimes.end()) return;
+    l = it->second->peakL.exchange (0.0f);
+    r = it->second->peakR.exchange (0.0f);
+}
+
+void Engine::readMasterPeaks (float& l, float& r)
+{
+    l = masterPeakL.exchange (0.0f);
+    r = masterPeakR.exchange (0.0f);
+}
+
+void Engine::readMeters (int trackId, Meters& out)
+{
+    if (trackId < 0)
+    {
+        out.peakL = masterPeakL.exchange (0.0f);
+        out.peakR = masterPeakR.exchange (0.0f);
+        const float n = (float) jmax (1, masterRmsCount.exchange (0));
+        out.rmsL = std::sqrt (jmax (0.0f, masterRmsAccL.exchange (0.0f) / n));
+        out.rmsR = std::sqrt (jmax (0.0f, masterRmsAccR.exchange (0.0f) / n));
+        out.clipped = masterClipped.load();
+        return;
+    }
+    auto it = runtimes.find (trackId);
+    if (it == runtimes.end() || it->second == nullptr) { out = {}; return; }
+    auto& rt = *it->second;
+    out.peakL = rt.peakL.exchange (0.0f);
+    out.peakR = rt.peakR.exchange (0.0f);
+    const float n = (float) jmax (1, rt.rmsCount.exchange (0));
+    out.rmsL = std::sqrt (jmax (0.0f, rt.rmsAccL.exchange (0.0f) / n));
+    out.rmsR = std::sqrt (jmax (0.0f, rt.rmsAccR.exchange (0.0f) / n));
+    out.clipped = rt.clipped.load();
+}
+
+void Engine::readScope (float* interleaved, int maxPairs)
+{
+    const int pairs = jlimit (0, kScopePairs, maxPairs);
+    for (int i = 0; i < pairs; ++i)
+    {
+        interleaved[i * 2] = scopeL[(size_t) i].load();
+        interleaved[i * 2 + 1] = scopeR[(size_t) i].load();
+    }
+}
+
+float Engine::getAutoVolNorm (int trackId) const
+{
+    auto it = runtimes.find (trackId);
+    return it == runtimes.end() ? -1.0f : it->second->autoVol.load();
+}
+
+float Engine::getAutoPanNorm (int trackId) const
+{
+    auto it = runtimes.find (trackId);
+    return it == runtimes.end() ? -1.0f : it->second->autoPan.load();
+}
+
+//==============================================================================
+void Engine::sendLiveMessage (const MidiMessage& m)
+{
+    auto mm = m;
+    const double now = Time::getMillisecondCounterHiRes();
+    mm.setTimeStamp (now * 0.001);
+    if (m.isNoteOn()) liveNotesHeld.fetch_add (1, std::memory_order_relaxed);
+    else if (m.isNoteOff()) { if (liveNotesHeld.load (std::memory_order_relaxed) > 0) liveNotesHeld.fetch_sub (1, std::memory_order_relaxed); }
+    else if (m.isAllNotesOff() || m.isAllSoundOff()) liveNotesHeld.store (0, std::memory_order_relaxed);
+    lastLiveMidiMs.store (now, std::memory_order_relaxed);
+    liveCollector.addMessageToQueue (mm);
+}
+
+void Engine::noteOn (int note, int velocity)
+{
+    // the idle release may have closed the device. Re-opening a driver can block for tens to
+    // hundreds of milliseconds (ASIO / WASAPI exclusive), so it must never happen on the
+    // message thread - that is the stutter the piano roll showed on the first note after a
+    // pause. The note is parked and sent when the device is back (audioDeviceAboutToStart),
+    // while the reopen itself runs on a helper thread.
+    if (deviceManager.getCurrentAudioDevice() == nullptr)
+    {
+        parkLiveNote (MidiMessage::noteOn (1, note, (uint8) jlimit (1, 127, velocity)));
+        openDeviceAsync();
+        return;
+    }
+    sendLiveMessage (MidiMessage::noteOn (1, note, (uint8) jlimit (1, 127, velocity)));
+}
+
+void Engine::noteOff (int note)
+{
+    if (deviceManager.getCurrentAudioDevice() == nullptr)
+    {
+        parkLiveNote (MidiMessage::noteOff (1, note));  // parked in order, so a key released
+        return;                                         // while opening still gets its off
+    }
+    sendLiveMessage (MidiMessage::noteOff (1, note));
+}
+
+void Engine::allLiveNotesOff()
+{
+    if (deviceManager.getCurrentAudioDevice() == nullptr)
+    {
+        parkLiveNote (MidiMessage::allNotesOff (1));
+        return;
+    }
+    sendLiveMessage (MidiMessage::allNotesOff (1));
+}
+
+void Engine::auditionNote (int note, int velocity, int durationMs)
+{
+    noteOn (note, velocity);
+    auditions.push_back ({ note, Time::getMillisecondCounterHiRes() + durationMs });
+}
+
+void Engine::handleIncomingMidiMessage (MidiInput* src, const MidiMessage& m)
+{
+    juce::ignoreUnused (src);
+    auto mm = m;
+    const double now = Time::getMillisecondCounterHiRes();
+    mm.setTimeStamp (now * 0.001);
+    if (m.isNoteOn()) liveNotesHeld.fetch_add (1, std::memory_order_relaxed);
+    else if (m.isNoteOff()) { if (liveNotesHeld.load (std::memory_order_relaxed) > 0) liveNotesHeld.fetch_sub (1, std::memory_order_relaxed); }
+    else if (m.isAllNotesOff() || m.isAllSoundOff()) liveNotesHeld.store (0, std::memory_order_relaxed);
+    lastLiveMidiMs.store (now, std::memory_order_relaxed);
+    liveCollector.addMessageToQueue (mm);
+}
+
+//==============================================================================
+Optional<AudioPlayHead::PositionInfo> Engine::getPosition() const
+{
+    PositionInfo info;
+    const double sr = sampleRate;
+    info.setBpm (ph.bpm);
+    info.setTimeSignature (TimeSignature { ph.num, ph.den });
+    info.setTimeInSamples (ph.samples);
+    info.setTimeInSeconds ((double) ph.samples / sr);
+    info.setPpqPosition (ph.ppq);
+    info.setPpqPositionOfLastBarStart (ph.ppqBarStart);
+    info.setIsPlaying (ph.playing);
+    info.setIsRecording (ph.recording);
+    info.setIsLooping (ph.looping);
+    info.setLoopPoints (LoopPoints { ph.loopStart, ph.loopEnd });
+    return info;
+}
+
+//==============================================================================
+void Engine::audioDeviceIOCallbackWithContext (const float* const* in, int numIn, float* const* out, int numOut,
+                                               int numSamples, const AudioIODeviceCallbackContext&)
+{
+    ScopedNoDenormals noDenormals;
+    for (int c = 0; c < numOut; ++c)
+        if (out[c] != nullptr) FloatVectorOperations::clear (out[c], numSamples);
+
+    if (hasPending.load (std::memory_order_acquire))
+    {
+        SpinLock::ScopedTryLockType l (snapLock);
+        if (l.isLocked())
+        {
+            audioSnap.store (pending, std::memory_order_release);
+            pending.reset();
+            hasPending.store (false, std::memory_order_release);
+        }
+    }
+
+    auto snap = audioSnap.load (std::memory_order_acquire);
+    if (snap == nullptr) return;
+
+    // A scrub seek is applied between blocks: render the old block, fade its tail to zero, jump,
+    // and let the next block fade back in. This keeps a dragged playhead from slicing the
+    // waveform at an arbitrary sample (which was the loud click while playing).
+    const bool seekPending = seekRequested.exchange (false, std::memory_order_acquire);
+    const int64 seekTarget = seekTargetSamples.load (std::memory_order_acquire);
+    bool seekNow = false;
+    if (seekPending)
+    {
+        if (playing.load() && ! recording.load() && seekTarget != posSamples.load())
+            seekNow = true;
+        else if (! playing.load() || recording.load())
+        {
+            posSamples.store (seekTarget);
+            flushNotes = true;
+        }
+    }
+    const bool fadeIn = seekFadeIn.exchange (false, std::memory_order_acquire);
+
+    RenderCtx ctx;
+    ctx.sampleRate = sampleRate;
+    ctx.allowLoop = ! recording.load() && ! rtCapture.active.load (std::memory_order_acquire);
+
+    int done = 0;
+    while (done < numSamples)
+    {
+        const int n = jmin (TrackRuntime::kMaxBlock, numSamples - done);
+        const float* inPtrs[32] = {};
+        for (int c = 0; c < jmin (numIn, 32); ++c)
+            inPtrs[c] = in[c] != nullptr ? in[c] + done : nullptr;
+
+        liveBuf.clear();
+        liveCollector.removeNextBlockOfMessages (liveBuf, n);
+
+        // MIDI learn: queue the controllers that arrive while it is armed, for the message thread
+        // (which owns the mappings and the plug-in parameters)
+        if (midiLearnOn.load (std::memory_order_acquire) && ccFifo.getFreeSpace() > 0)
+        {
+            const auto scope = ccFifo.write (jmin (ccFifo.getFreeSpace(), liveBuf.getNumEvents()));
+            int written = 0;
+            for (const auto meta : liveBuf)
+            {
+                const auto m = meta.getMessage();
+                const bool isCc = m.isController();
+                const bool isNote = m.isNoteOn();
+                if (! isCc && ! isNote) continue;
+                if (written >= scope.blockSize1 + scope.blockSize2) break;
+
+                CcEvent e;
+                e.channel = m.getChannel();
+                e.cc = isCc ? m.getControllerNumber() : m.getNoteNumber();
+                e.value = isCc ? m.getControllerValue() : m.getVelocity();
+                e.isNote = isNote;
+                if (written < scope.blockSize1)
+                    ccData[(size_t) (scope.startIndex1 + written)] = e;
+                else
+                    ccData[(size_t) (scope.startIndex2 + written - scope.blockSize1)] = e;
+                ++written;
+            }
+            ccFifo.finishedWrite (written);
+        }
+
+        const bool isPlay = playing.load();
+        int64 pos = posSamples.load();
+
+        if (isPlay && recording.load())
+        {
+            feedRecorders (inPtrs, numIn, n, pos);
+            if (midiRecording.load())
+            {
+                for (auto meta : liveBuf)
+                {
+                    auto raw = meta.data;
+                    const int len = meta.numBytes;
+                    if (len < 1 || len > 3 || (raw[0] & 0xf0) == 0xf0) continue;
+                    const int64 p = pos + meta.samplePosition;
+                    if (recFifo.getFreeSpace() < 1) break;
+                    RecEvent e;
+                    e.pos = p; e.len = (uint8) len;
+                    for (int i = 0; i < len; ++i) e.data[i] = raw[i];
+                    const auto w = recFifo.write (1);
+                    if (w.blockSize1 > 0) recFifoData[(size_t) w.startIndex1] = e;
+                    else if (w.blockSize2 > 0) recFifoData[(size_t) w.startIndex2] = e;
+                }
+            }
+        }
+
+        renderChunk (*snap, ctx, pos, isPlay, n, mixBuf, &liveBuf, inPtrs, numIn);
+        if (isPlay) posSamples.store (pos);
+
+        // real-time mixdown: append the finished master output to the capture buffer
+        if (rtCapture.active.load (std::memory_order_acquire))
+        {
+            const SpinLock::ScopedTryLockType capLock (rtCapture.lock);
+            if (capLock.isLocked() && rtCapture.buffer != nullptr)
+            {
+                auto& cap = *rtCapture.buffer;
+                const int64 p = rtCapture.pos.load (std::memory_order_relaxed);
+                const int m = (int) jmin<int64> (n, rtCapture.total - p);
+                if (m > 0)
+                {
+                    cap.copyFrom (0, (int) p, mixBuf, 0, 0, m);
+                    cap.copyFrom (1, (int) p, mixBuf, 1, 0, m);
+                    const int64 np = p + m;
+                    rtCapture.pos.store (np, std::memory_order_release);
+                    if (np >= rtCapture.total)
+                    {
+                        rtCapture.active.store (false, std::memory_order_release);
+                        rtCapture.done.store (true, std::memory_order_release);
+                    }
+                }
+                else
+                {
+                    rtCapture.active.store (false, std::memory_order_release);
+                    rtCapture.done.store (true, std::memory_order_release);
+                }
+            }
+        }
+
+        if (numOut >= 2)
+        {
+            if (out[0] != nullptr) FloatVectorOperations::copy (out[0] + done, mixBuf.getReadPointer (0), n);
+            if (out[1] != nullptr) FloatVectorOperations::copy (out[1] + done, mixBuf.getReadPointer (1), n);
+        }
+        else if (numOut == 1 && out[0] != nullptr)
+        {
+            for (int i = 0; i < n; ++i)
+                out[0][done + i] = 0.5f * (mixBuf.getSample (0, i) + mixBuf.getSample (1, i));
+        }
+        done += n;
+    }
+
+    auto applySeekRamp = [&] (bool fadeUp)
+    {
+        const int f = jmin (64, numSamples);
+        if (f < 2) return;
+        for (int i = 0; i < f; ++i)
+        {
+            const float t = (float) i / (float) (f - 1);
+            const float gain = fadeUp ? t : 1.0f - t;
+            const int idx = fadeUp ? i : numSamples - f + i;
+            for (int c = 0; c < numOut; ++c)
+                if (out[c] != nullptr) out[c][idx] *= gain;
+        }
+    };
+
+    if (fadeIn) applySeekRamp (true);
+
+    if (seekNow)
+    {
+        applySeekRamp (false);
+        posSamples.store (seekTarget);
+        flushNotes.store (true, std::memory_order_release);
+        seekFadeIn.store (true, std::memory_order_release);
+        requestPdcFlush();      // the block after the jump must not read pre-seek ring content
+    }
+}
+
+//==============================================================================
+void Engine::renderChunk (const Snap& s, const RenderCtx& ctx, int64& pos, bool isPlaying, int n,
+                          AudioBuffer<float>& out, const MidiBuffer* liveMidi, const float* const* inputs, int numIn)
+{
+    const double sr = ctx.sampleRate;
+    const auto& tempo = s.tempo;
+    const bool flush = ctx.realtime && flushNotes.exchange (false);
+    // A Studio One style real-time mixdown records the plain master output: monitor-only paths
+    // (listen bus, media pool preview) and the metronome must not leak into the file.
+    const bool capturing = rtCapture.active.load (std::memory_order_acquire);
+
+    //== PDC ring flush after a transport discontinuity ========================================
+    // play / stop / seek / loop wrap only set a latch from the message thread; the delay rings
+    // are dropped here, on the render thread, before anything is rendered from the new position.
+    // pdcDelay() re-primes each ring with its existing 64-sample fade-in, so the flush itself
+    // cannot click - and setting appliedPad back to -1 tells it the ring is already zeroed.
+    // Only the realtime callback consumes it: offline renders reset every ring themselves before
+    // each pass (resetAll), and must never have that state pulled out from under a running file.
+    if (ctx.realtime && pdcFlushPending.exchange (false, std::memory_order_acq_rel))
+    {
+        for (auto& ts : s.tracks)
+            if (ts.rt != nullptr)
+            {
+                auto& rt = *ts.rt;
+                // padApplied > 0 is the only state in which the ring was ever written to; 0 and
+                // -1 both mean it is already silent (pdcDelay() primes with a fade-in)
+                if (rt.padApplied > 0) std::fill (rt.delayLine.begin(), rt.delayLine.end(), 0.0f);
+                rt.write = 0;
+                rt.padApplied = -1;
+                rt.padFade = 0;
+                // preDelayLine has no reader in the current render paths (pre-fader sends use
+                // their own SendDelayState below); only its book keeping is reset
+                rt.preWrite = 0;
+                rt.prePadApplied = -1;
+                rt.prePadFade = 0;
+
+                for (auto& sn : ts.sends)
+                    if (sn.delay != nullptr)
+                    {
+                        if (sn.delay->applied > 0) std::fill (sn.delay->ring.begin(), sn.delay->ring.end(), 0.0f);
+                        sn.delay->write = 0;
+                        sn.delay->applied = -1;
+                        sn.delay->fade = 0;
+                    }
+            }
+        if (masterPadApplied > 0) std::fill (masterDelayLine.begin(), masterDelayLine.end(), 0.0f);
+        masterDelayWrite = 0;
+        masterPadApplied = -1;
+        masterPadFade = 0;
+        if (metroPadApplied > 0) std::fill (metroDelayLine.begin(), metroDelayLine.end(), 0.0f);
+        metroDelayWrite = 0;
+        metroPadApplied = -1;
+        metroPadFade = 0;
+    }
+
+    struct Seg { int64 start; int off; int len; bool jump; };
+    Seg segs[8];
+    int nseg = 0;
+    const bool loop = ctx.allowLoop && s.loopOn && s.loopEndBeat > s.loopStartBeat + 1.0e-6;
+    const int64 ls = (int64) std::llround (tempomap::beatsToSeconds (tempo, s.loopStartBeat) * sr);
+    const int64 le = (int64) std::llround (tempomap::beatsToSeconds (tempo, s.loopEndBeat) * sr);
+    const int64 startPos = pos;
+
+    if (isPlaying)
+    {
+        int64 p = pos;
+        int off = 0, remaining = n;
+        bool jump = false;
+        while (remaining > 0 && nseg < 8)
+        {
+            int len = remaining;
+            const bool hit = loop && p < le && p + len >= le;
+            if (hit) len = (int) (le - p);
+            if (len > 0) segs[nseg++] = { p, off, len, jump };
+            jump = false;
+            p += len; off += len; remaining -= len;
+            if (hit) { p = ls; jump = true; if (remaining == 0) flushNotes = true;
+                       // the loop went back to loopStart: drop the PDC rings before the next block
+                       // so no pre-wrap tail (up to maxPdc samples) is replayed over the new pass
+                       pdcFlushPending.store (true, std::memory_order_release); }
+        }
+        pos = p;
+    }
+
+    ph.samples = jmax<int64> (0, startPos);
+    ph.playing = isPlaying;
+    ph.recording = ctx.realtime && recording.load();
+    ph.looping = loop;
+    ph.loopStart = s.loopStartBeat; ph.loopEnd = s.loopEndBeat;
+
+    const double beatNow = tempomap::secondsToBeats (tempo, (double) jmax<int64> (0, startPos) / sr);
+    ph.bpm = tempomap::bpmAt (tempo, jmax (0.0, beatNow));
+    tempomap::meterAt (tempo, jmax (0.0, beatNow), ph.num, ph.den);
+    ph.ppq = beatNow;
+    ph.ppqBarStart = tempomap::barStartAtOrBefore (tempo, jmax (0.0, beatNow));
+
+    // live MIDI targets
+    bool anyArmedInst = false;
+    if (ctx.realtime)
+        for (auto& ts : s.tracks) if (ts.rt->arm.load() && ! ts.rt->isAudio.load()) anyArmedInst = true;
+    const int selTrack = selectedTrack.load();
+    const bool listenSolo = anyListenSolo.load() && ctx.realtime;   // monitoring only, never an export
+    const bool solo = anySolo.load() && ! listenSolo;   // listening wins over solo
+    // Idle instrument bypass (see renderTrack): only while the transport has been stopped for a
+    // moment and nothing was played live. One timestamp check per block, not per track.
+    const double nowMs = Time::getMillisecondCounterHiRes();
+    const double stoppedAt = stoppedSinceMs.load (std::memory_order_relaxed);
+    const double lastLive = lastLiveMidiMs.load (std::memory_order_relaxed);
+    const bool idleInstrumentSkip = ctx.realtime && ! isPlaying
+                                    && stoppedAt > 0.0 && nowMs - stoppedAt > 3000.0
+                                    && liveNotesHeld.load (std::memory_order_relaxed) == 0
+                                    && (lastLive <= 0.0 || nowMs - lastLive > 5000.0);
+    // Soloing an effect return keeps the feeds into it alive while every ordinary dry output stays
+    // muted. Which tracks have to render for that is decided on the message thread
+    // (syncMixToRuntimes publishes it as TrackRuntime::feedNeeded); here only the mute / solo /
+    // listen state is evaluated.
+    const bool sendSoloActive = anySoloSend.load() && ! listenSolo && ! ctx.ignoreMuteSolo;
+    auto dryAudible = [&] (const TrackRuntime& r) -> bool
+    {
+        if (ctx.ignoreMuteSolo) return true;
+        if (r.mute.load()) return false;
+        if (listenSolo) return r.listenSolo.load();
+        if (solo) return r.solo.load();
+        return true;
+    };
+    // a send may only accumulate into a channel that is actually rendered this block (feeding a
+    // skipped channel would only be cleared again next block)
+    auto sendTargetRendered = [&] (const TrackRuntime& r) -> bool
+    {
+        if (ctx.ignoreMuteSolo) return true;
+        if (r.mute.load()) return false;
+        if (listenSolo) return r.listenSolo.load();
+        if (solo) return r.solo.load() || r.feedNeeded.load();
+        return true;
+    };
+    // both taps of a send (post-fader and pre-fader) end up here; the serial and the deferred
+    // multi-core path share it so both produce exactly the same samples
+    auto feedSendTo = [&] (TrackRuntime& srcRt, const SendSnap& sn, const float* const* src, bool srcAudible)
+    {
+        if (sn.target == nullptr || ! sendTargetRendered (*sn.target)) return;
+        // a track that renders only to feed sends may pour its wet only into the returns the user
+        // soloed (or the buses on the way into them), never into an auto-soloed return of another
+        // soloed track that would otherwise stay dry
+        if (! srcAudible && ! sn.target->soloExplicit.load() && ! sn.target->feedNeeded.load()) return;
+        if (sn.pad > 0 && sn.delay != nullptr && ! ctx.noPdcPad)
+        {
+            for (int c = 0; c < 2; ++c) FloatVectorOperations::copy (srcRt.sendBuf.getWritePointer (c), src[c], n);
+            pdcDelay (sn.delay->ring, sn.delay->write, sn.delay->applied, sn.delay->fade,
+                      jlimit (0, TrackRuntime::kPdcCap - 1, sn.pad),
+                      srcRt.sendBuf.getWritePointer (0), srcRt.sendBuf.getWritePointer (1), n);
+            for (int c = 0; c < 2; ++c)
+                sn.target->accum.addFrom (c, 0, srcRt.sendBuf, c, 0, n, sn.gain);
+        }
+        else
+            for (int c = 0; c < 2; ++c)
+                sn.target->accum.addFrom (c, 0, src[c], n, sn.gain);
+    };
+
+    out.clear (0, n);
+    if (out.getNumChannels() > 1) out.clear (1, 0, n);
+
+    // bus / effect-return tracks collect everything routed into them here
+    for (auto& ts : s.tracks)
+        if (ts.isBus || ts.isSend)
+            ts.rt->accum.clear (0, n);
+
+    // parents of printed multi-output channels keep their insert chain in a "no effects"
+    // freeze: a channel's frozen audio has the parent chain baked in, so only each printed
+    // track's OWN inserts follow the with / without effects choice
+    std::set<int> parentsOfPrinted;
+    if (ctx.printIds != nullptr && ctx.bypassInserts)
+        for (auto& ts2 : s.tracks)
+            if (ts2.sourceRt != nullptr
+                && std::find (ctx.printIds->begin(), ctx.printIds->end(), ts2.rt->trackId) != ctx.printIds->end())
+                parentsOfPrinted.insert (ts2.sourceRt->trackId);
+
+    auto renderTrack = [&] (const TrackSnap& ts, AudioBuffer<float>& masterOut, bool routeAndSends)
+    {
+        auto& rt = *ts.rt;
+        // the dry output decision is taken before the render gating below: the deferred routing
+        // reads it back after the workers are done (see routeTrack)
+        const bool audible = dryAudible (rt);
+        rt.dryMuted = ! audible;
+        if (ts.isListenBus) return;          // fed by the master mix, not by sends
+        // a single-track render only runs the selected track; when that track is a multi-output
+        // channel, its source instrument track is rendered too so the channel has an input
+        if (ctx.renderIds != nullptr)
+        {
+            bool involved = false;
+            for (int id : *ctx.renderIds) if (id == rt.trackId) { involved = true; break; }
+            if (! involved) return;
+        }
+        else if (ctx.onlyTrack >= 0 && rt.trackId != ctx.onlyTrack && rt.trackId != ctx.onlyTrackSource) return;
+
+        // Mute / solo outside the rendered path: an inaudible track does not run its instrument,
+        // inserts, sends or metering at all. This is what saves CPU on a big session (the old
+        // path processed everything and only faded the fader to zero). The exception is a send
+        // feed needed by a soloed effect return: such a track keeps rendering with its real fader
+        // gain (the post-fader send taps must keep their level) but only its sends are routed.
+        const bool feedOnly = ! audible && sendSoloActive && ! rt.mute.load() && rt.feedNeeded.load();
+        if (! audible && ! feedOnly && ! ts.hasOutputChildren)
+        {
+            if (rt.wasAudible)
+            {
+                // flush the instrument so a note held when the track became inaudible does not
+                // come back as a stuck voice when it is unmuted again
+                if (ts.instrument != nullptr && ts.instrument->proc != nullptr) ts.instrument->proc->reset();
+                for (auto& ins : ts.inserts)
+                    if (ins != nullptr && ins->proc != nullptr) ins->proc->reset();
+                rt.wasAudible = false;
+            }
+            rt.buf.clear (0, n);
+            rt.scLen = 0;          // no fresh side-chain source while the track is silent
+            rt.routeSilent = true;
+            return;
+        }
+        rt.wasAudible = true;
+        rt.routeSilent = false;
+
+        // A big sampler should not be woken up every block for nothing:
+        // - the transport has been stopped for a moment (idleInstrumentSkip), or
+        // - the track has no MIDI events at all and nothing is being played live on it.
+        // Armed / monitored tracks and a held live note always keep processing.
+        const bool emptyInstrument = ts.instrument != nullptr && ! rt.isAudio.load() && ! ts.frozen
+                                     && ! rt.arm.load() && ! rt.monitor.load()
+                                     && (idleInstrumentSkip
+                                         || (ts.events.empty() && ts.regions.empty()
+                                             && liveNotesHeld.load (std::memory_order_relaxed) == 0
+                                             && (lastLive <= 0.0 || nowMs - lastLive > 3000.0)));
+        if (emptyInstrument)
+        {
+            if (! rt.idleSkipActive)
+            {
+                // the PDC ring did not advance while bypassed: drop its old content once, so the
+                // first block after resuming does not replay the tail from before the idle gap
+                if (ts.pad > 0 || rt.padApplied > 0) rt.resetDelay();
+                rt.idleSkipActive = true;
+            }
+            rt.buf.clear (0, n);
+            rt.scLen = 0;
+            rt.routeSilent = true;
+            return;
+        }
+        rt.idleSkipActive = false;
+
+        rt.buf.clear (0, n);
+        for (int c = 2; c < rt.buf.getNumChannels(); ++c) rt.buf.clear (c, 0, n);
+        rt.midi.clear();
+
+        const bool isGroupTrack = ts.isBus || ts.isSend;
+        const bool isAudioTrack = rt.isAudio.load() || ts.frozen;   // frozen tracks play their render
+        const int midiCh = jlimit (1, 16, rt.midiChannel.load());
+
+        //== MIDI generation
+        if (ts.sourceRt != nullptr)
+        {
+            // a multi-output channel track: its input is the instrument's own buffer, so it runs
+            // after that track was rendered (the render order guarantees it) and only takes its
+            // channel pair, leaving the parent's inserts / fader to the parent
+            const auto& src = *ts.sourceRt;
+            const int c0 = ts.sourceChannel;
+            if (c0 >= 0 && c0 + 1 < src.buf.getNumChannels())
+            {
+                rt.buf.copyFrom (0, 0, src.buf, c0, 0, n);
+                rt.buf.copyFrom (1, 0, src.buf, c0 + 1, 0, n);
+            }
+        }
+        else if (isGroupTrack)
+        {
+            // a bus / send track starts from the sum of its inputs
+            for (int c = 0; c < 2; ++c)
+                rt.buf.copyFrom (c, 0, rt.accum, c, 0, n);
+        }
+        else if (! isAudioTrack)
+        {
+            if (flush) addNotesOff (rt.midi, midiCh, 0);
+
+            if (ctx.realtime && liveMidi != nullptr)
+            {
+                const bool target = anyArmedInst ? rt.arm.load() : rt.trackId == selTrack;
+                if (target)
+                    for (auto meta : *liveMidi)
+                    {
+                        auto m = meta.getMessage();
+                        if (m.getRawDataSize() <= 3 && ! m.isSysEx())
+                        {
+                            if (m.getChannel() > 0) m.setChannel (midiCh);
+                            rt.midi.addEvent (m, jlimit (0, n - 1, meta.samplePosition));
+                        }
+                    }
+            }
+
+            for (int si = 0; si < nseg; ++si)
+            {
+                const auto& sg = segs[si];
+                if (sg.jump) addNotesOff (rt.midi, midiCh, sg.off);
+                if (sg.start + sg.len <= 0) continue;   // entirely before the timeline
+                const double b0 = tempomap::secondsToBeats (tempo, (double) (sg.start - 2) / sr);
+                auto it = std::lower_bound (ts.events.begin(), ts.events.end(), b0, [] (const MidiEv& e, double b) { return e.beat < b; });
+                for (; it != ts.events.end(); ++it)
+                {
+                    const double esec = it->sec * sr;
+                    const int64 es = (int64) std::ceil (esec - 1.0e-6);
+                    if (es >= sg.start + sg.len) break;   // the rest belongs to a later block
+                    if (es < sg.start) continue;          // already played before this block
+                    rt.midi.addEvent (it->msg, sg.off + (int) (es - sg.start));
+                }
+            }
+        }
+        else
+        {
+            for (int si = 0; si < nseg; ++si)
+                for (auto& r : ts.regions)
+                    mixRegion (r, rt, segs[si].start, segs[si].off, segs[si].len, tempo, sr);
+
+            if (ctx.realtime && rt.monitor.load() && inputs != nullptr && numIn > 0)
+            {
+                const int c0 = jlimit (0, numIn - 1, rt.inputChannel.load());
+                const bool mono = rt.inputMono.load() || c0 + 1 >= numIn;
+                const float* l = inputs[c0];
+                const float* r = mono ? inputs[c0] : inputs[c0 + 1];
+                if (l != nullptr) FloatVectorOperations::add (rt.buf.getWritePointer (0), l, n);
+                if (r != nullptr) FloatVectorOperations::add (rt.buf.getWritePointer (1), r, n);
+            }
+        }
+
+        //== automation
+        // A freeze render (flatFader) bakes the sound of the instrument and its insert chain, but
+        // it deliberately *not* the fader / pan automation: those lanes stay in the channel and
+        // keep working (and stay editable) after the freeze.
+        const bool flat = ctx.flatFader;
+        float volNorm = rt.volNorm.load(), volEnd = volNorm;
+        float panVal = rt.pan.load(), panEnd = panVal;
+        bool volAuto = false, panAuto = false;
+        if (ts.autoMode != AutoMode::Off)
+        {
+            for (auto& lane : ts.lanes)
+            {
+                if (lane.points.empty()) return;
+                const double bStart = isPlaying && nseg > 0
+                    ? tempomap::secondsToBeats (tempo, (double) jmax<int64> (0, segs[0].start) / sr)
+                    : beatNow;
+                const double bEnd = tempomap::secondsToBeats (tempo, tempomap::beatsToSeconds (tempo, bStart) + (double) n / sr);
+                if (lane.kind == LaneSnap::Vol && rt.touched.load() != 1)
+                {
+                    if (flat) continue;   // freeze: the fader is neutral and its curve plays live
+                    volNorm = evalAutoLane (lane.points, bStart); volEnd = evalAutoLane (lane.points, bEnd); volAuto = true;
+                }
+                else if (lane.kind == LaneSnap::Pan && rt.touched.load() != 2)
+                {
+                    if (flat) continue;   // freeze: pan stays neutral and its curve plays live
+                    panVal = panFromNorm (evalAutoLane (lane.points, bStart)); panEnd = panFromNorm (evalAutoLane (lane.points, bEnd)); panAuto = true;
+                }
+                else if (lane.kind == LaneSnap::Param && lane.param != nullptr && lane.inst != nullptr
+                         && lane.inst->touchedParam.load() != lane.paramIndex)
+                {
+                    const float v = evalAutoLane (lane.points, bStart);
+                    if (std::abs (v - lane.lastApplied) > 1.0e-4f)
+                    {
+                        lane.lastApplied = v;
+                        lane.param->setValue (v);
+                    }
+                }
+            }
+        }
+        if (ctx.realtime)
+        {
+            rt.autoVol.store (volAuto ? volNorm : -1.0f);
+            rt.autoPan.store (panAuto ? panVal : -1.0f);
+        }
+
+        //== plugin chain
+        // Layered instruments: every layer renders the track's MIDI on its own pass over the
+        // buffer, is scaled / panned, and the results are summed before the inserts (so a layer
+        // never sees the audio of another one). Plug-ins clear the MidiBuffer they are given, so
+        // each pass gets its own copy of the track's events.
+        const bool layered = ts.instrument != nullptr && ! ts.extraInstruments.empty() && ! isAudioTrack;
+        if (ts.instrument != nullptr && ! isAudioTrack)
+        {
+            if (! layered)
+            {
+                processPlugin (*ts.instrument, rt, n, rt.midi);
+            }
+            else
+            {
+                auto renderLayer = [&] (PluginInstance& inst, float gain, float pan)
+                {
+                    rt.instrumentMidi.clear();
+                    for (auto meta : rt.midi)
+                        rt.instrumentMidi.addEvent (meta.getMessage(), meta.samplePosition);
+
+                    for (int c = 0; c < rt.buf.getNumChannels(); ++c) rt.buf.clear (c, 0, n);
+                    processPlugin (inst, rt, n, rt.instrumentMidi);
+
+                    float gl = gain, gr = gain;
+                    panGains (gain, pan, gl, gr);
+                    for (int i = 0; i < n; ++i)
+                    {
+                        rt.accum.getWritePointer (0)[i] += rt.buf.getReadPointer (0)[i] * gl;
+                        rt.accum.getWritePointer (1)[i] += rt.buf.getReadPointer (1)[i] * gr;
+                    }
+                };
+
+                for (int c = 0; c < 2; ++c) rt.accum.clear (c, 0, n);
+                renderLayer (*ts.instrument, 1.0f, 0.0f);
+                for (auto& layer : ts.extraInstruments)
+                    if (layer.inst != nullptr) renderLayer (*layer.inst, layer.gain, layer.pan);
+                for (int c = 0; c < 2; ++c) rt.buf.copyFrom (c, 0, rt.accum, c, 0, n);
+                for (int c = 2; c < rt.buf.getNumChannels(); ++c) rt.buf.clear (c, 0, n);
+            }
+        }
+        const bool chainsSplit = (ts.isBus || ts.isSend);   // bus inserts can sit after the fader
+        // a "no effects" freeze skips the inserts of each printed track; the parent chain of a
+        // multi-output channel is part of the instrument sound and always stays in (the parent's
+        // own printed audio takes the pre-insert tap in that case, see below)
+        const bool printedHere = ctx.printIds != nullptr
+            ? std::find (ctx.printIds->begin(), ctx.printIds->end(), rt.trackId) != ctx.printIds->end()
+            : (ctx.onlyTrack >= 0 && rt.trackId == ctx.onlyTrack);
+        const bool insertsOn = ! ctx.bypassInserts || ! printedHere || parentsOfPrinted.count (rt.trackId) > 0;
+        // "no effects" freeze of a printed track: its file is the signal before its OWN insert
+        // chain (rt.preBuf; the freeze renders no sends, so the tap is free). A printed parent
+        // keeps its chain running for its output channels and prints the dry instrument instead.
+        const bool printPreInsert = ctx.printIds != nullptr && ctx.bypassInserts && printedHere;
+        if (printPreInsert)
+            for (int c = 0; c < jmin (2, rt.preBuf.getNumChannels()); ++c)
+                rt.preBuf.copyFrom (c, 0, rt.buf, c, 0, n);
+        // side-chain sources were resolved when the snapshot was built (message thread): the
+        // render threads must not look anything up in Engine::runtimes, which the message thread
+        // mutates while tracks are added / removed / re-routed
+        auto scFor = [&ts] (size_t index) -> TrackRuntime*
+        {
+            return index < ts.insertSidechainRt.size() ? ts.insertSidechainRt[index].get() : nullptr;
+        };
+        for (size_t i = 0; i < ts.inserts.size(); ++i)
+        {
+            auto& ins = ts.inserts[i];
+            if (ins != nullptr && insertsOn && (! chainsSplit || ! ins->postFader.load()))
+                processPlugin (*ins, rt, n, rt.noMidi, scFor (i));
+        }
+
+        // the post-inserts signal is the side-chain source for other tracks (pre-fader, like a
+        // hardware side-chain send)
+        {
+            const int m = jmin (n, TrackRuntime::kMaxBlock);
+            FloatVectorOperations::copy (rt.scL, rt.buf.getReadPointer (0), m);
+            FloatVectorOperations::copy (rt.scR, rt.buf.getReadPointer (1), m);
+            rt.scLen = m;
+        }
+
+        //== fader / pan (the track was already skipped above when it is inaudible)
+        const bool routing = routeAndSends && ctx.onlyTrack < 0;      // stems / merge renders ignore buses + sends
+        const bool deferred = ! routeAndSends;
+
+        // pre-fader sends take the signal before the fader gain (a multi-target freeze keeps
+        // rt.preBuf for its own pre-insert print tap, so its sends read that instead: the
+        // bus mixes are never printed there anyway)
+        bool anyPreSend = false;
+        if ((routing || deferred) && (audible || feedOnly) && ctx.printIds == nullptr)
+            for (auto& sn : ts.sends) anyPreSend = anyPreSend || (sn.pre && sn.target != nullptr);
+        if (anyPreSend)
+            for (int c = 0; c < 2; ++c)
+                rt.preBuf.copyFrom (c, 0, rt.buf, c, 0, n);
+
+        // a send-feed track keeps its real fader gain: a post-fader send must tap the same level
+        // it has when that track is not muted; only its dry output is suppressed below
+        const float targetVol = flat ? 1.0f : ((audible || feedOnly) ? faderToGain (volEnd) : 0.0f);
+        const float panNow = flat ? 0.0f : (panAuto ? panEnd : panVal);
+        float gl, gr;
+        panGains (targetVol, panNow, gl, gr);
+        if (rt.lastGainL < 0.0f) { rt.lastGainL = gl; rt.lastGainR = gr; rt.lastPhase = ts.phaseInvert; }
+        const float glStart = rt.lastPhase ? -rt.lastGainL : rt.lastGainL;
+        const float grStart = rt.lastPhase ? -rt.lastGainR : rt.lastGainR;
+        const float glEnd = ts.phaseInvert ? -gl : gl;
+        const float grEnd = ts.phaseInvert ? -gr : gr;
+        rt.buf.applyGainRamp (0, 0, n, glStart, glEnd);
+        rt.buf.applyGainRamp (1, 0, n, grStart, grEnd);
+        const bool silent = gl < 1.0e-5f && gr < 1.0e-5f;
+        rt.lastGainL = gl; rt.lastGainR = gr; rt.lastPhase = ts.phaseInvert;
+        // a send-feed track still has to route its pre-fader sends when the fader is pulled all
+        // the way down; a post-fader send then taps the (zero) faded buffer as usual
+        rt.routeSilent = silent && ! feedOnly;
+
+        // inserts marked post-fader run after the bus fader (the master chain does this itself)
+        if (chainsSplit && insertsOn)
+            for (auto& ins : ts.inserts)
+                if (ins != nullptr && ins->postFader.load())
+                    processPlugin (*ins, rt, n, rt.noMidi);
+
+        // deferred routing consumes this tap after the block; capture it before the PDC pad so
+        // a post-fader send keeps the same timing as the serial path
+        if (deferred && ! ts.sends.empty())
+            for (int c = 0; c < 2; ++c)
+                rt.postBuf.copyFrom (c, 0, rt.buf, c, 0, n);
+
+        if (ctx.realtime)
+        {
+            const float pl = rt.buf.getMagnitude (0, 0, n), pr = rt.buf.getMagnitude (1, 0, n);
+            if (pl > rt.peakL.load()) rt.peakL.store (pl);
+            if (pr > rt.peakR.load()) rt.peakR.store (pr);
+            if (pl > 1.0f || pr > 1.0f) rt.clipped.store (true);
+            // sum of squares for the RMS part of the meter
+            double sl = 0.0, sr = 0.0;
+            const auto* l0 = rt.buf.getReadPointer (0);
+            const auto* r0 = rt.buf.getReadPointer (1);
+            for (int i = 0; i < n; ++i) { sl += (double) l0[i] * l0[i]; sr += (double) r0[i] * r0[i]; }
+            rt.rmsAccL.store (rt.rmsAccL.load() + (float) sl);
+            rt.rmsAccR.store (rt.rmsAccR.load() + (float) sr);
+            rt.rmsCount.store (rt.rmsCount.load() + n);
+        }
+
+        //== sends: both taps are taken *before* the track's PDC pad, and each send is delayed by
+        //   its own amount so the wet path lands on maxPath too (a linear-phase EQ on a return
+        //   must not come back late)
+        if (routing && (audible ? ! silent : feedOnly))
+            for (auto& sn : ts.sends)
+                if (! sn.pre) feedSendTo (rt, sn, rt.buf.getArrayOfReadPointers(), audible);
+
+        //== plug-in delay compensation: pad this track so it lines up with the deepest path
+        const int trackDelay = ctx.noPdcPad ? 0 : ts.pad;
+        if (trackDelay > 0 || rt.padApplied != trackDelay)
+            pdcDelay (rt.delayLine, rt.write, rt.padApplied, rt.padFade, trackDelay,
+                      rt.buf.getWritePointer (0), rt.buf.getWritePointer (1), n);
+
+        //== pre-fader sends (their tap was copied before the fader, i.e. before this pad). A
+        //   send-feed track carries them even when its own fader is at -inf; the ordinary path
+        //   keeps the existing "silent" skip so nothing changes while no Send is soloed.
+        //   The deferred (multi-core) path feeds every send from routeTrack() after the whole
+        //   level is rendered - feeding them here as well would double the send level (and made
+        //   a pre-fader send twice as loud as in the serial render).
+        if (! deferred && anyPreSend && (audible ? ! silent : feedOnly))
+            for (auto& sn : ts.sends)
+                if (sn.pre) feedSendTo (rt, sn, rt.preBuf.getArrayOfReadPointers(), audible);
+
+        //== dry route: into its output bus, or straight to the master
+        if (! silent)
+        {
+            // a dry-muted track exists only to feed a soloed return: it may pass signal into the
+            // bus chain that leads there, but never into the master or into an audible bus
+            const bool neededBus = ! audible && ts.dest != nullptr
+                                   && ts.dest->feedNeeded.load() && ! dryAudible (*ts.dest);
+            if (routing && ts.dest != nullptr)
+            {
+                if (audible || neededBus)
+                    for (int c = 0; c < 2; ++c)
+                        ts.dest->accum.addFrom (c, 0, rt.buf, c, 0, n);
+            }
+            else if (audible && routeAndSends && ctx.printIds == nullptr && (ctx.onlyTrack < 0 || rt.trackId == ctx.onlyTrack))
+            {
+                // multi-target freeze reads the runtime buffers after the block instead: several
+                // printed tracks must not be summed into one master output
+                masterOut.addFrom (0, 0, rt.buf, 0, 0, n);
+                masterOut.addFrom (1, 0, rt.buf, 1, 0, n);
+            }
+        }
+    };
+
+    // Deferred routing for the multi-core scheduler. Workers only fill each track's buffer; the
+    // audio thread performs the (cheap) bus / send summing after a whole dependency level is done.
+    auto routeTrack = [&] (const TrackSnap& ts)
+    {
+        auto& rt = *ts.rt;
+        if (rt.routeSilent) return;
+        const bool routing = ctx.onlyTrack < 0;
+        const bool audible = ! rt.dryMuted;     // dry output may reach the master / its bus
+
+        for (auto& sn : ts.sends)
+            feedSendTo (rt, sn, sn.pre ? rt.preBuf.getArrayOfReadPointers()
+                                       : rt.postBuf.getArrayOfReadPointers(), audible);
+
+        const bool neededBus = ! audible && ts.dest != nullptr
+                               && ts.dest->feedNeeded.load() && ! dryAudible (*ts.dest);
+        if (routing && ts.dest != nullptr)
+        {
+            if (audible || neededBus)
+                for (int c = 0; c < 2; ++c)
+                    ts.dest->accum.addFrom (c, 0, rt.buf, c, 0, n);
+        }
+        else if (audible)
+        {
+            out.addFrom (0, 0, rt.buf, 0, 0, n);
+            out.addFrom (1, 0, rt.buf, 1, 0, n);
+        }
+    };
+
+    //== multi-core scheduler -------------------------------------------------------------------
+    // The dependency levels were computed when the snapshot was built (message thread), so this
+    // path does no allocation at all. Tracks in one level never read another track's output, so
+    // they can render concurrently; buses / sends / side-chains / multi-output children land in
+    // a later level. A snapshot without levels is rendered serially.
+    const bool parallelNow = multiCore.load (std::memory_order_acquire) && renderWorkers > 0
+                             && ctx.onlyTrack < 0 && n >= 64 && ! s.levels.empty();
+    lastRenderParallel.store (parallelNow, std::memory_order_release);
+
+    if (parallelNow)
+    {
+        for (auto& idxs : s.levels)
+        {
+            if (idxs.empty()) continue;
+            if (idxs.size() > 1)
+            {
+                // fixed lane ownership: item k always runs on lane k % laneCount, so a track's
+                // plug-in sees the same processing thread every block (never work stealing)
+                renderPool.runLanes ((int) idxs.size(), [&] (int k)
+                {
+                    renderTrack (s.tracks[(size_t) idxs[(size_t) k]], out, false);
+                });
+            }
+            else
+            {
+                renderTrack (s.tracks[(size_t) idxs[0]], out, false);
+            }
+
+            // all dependencies of this level are rendered: perform the cheap routing on the
+            // audio thread, in the stable snapshot order
+            for (int trackIndex : idxs)
+                routeTrack (s.tracks[(size_t) trackIndex]);
+        }
+    }
+    else
+    {
+        for (int trackIndex : s.order)
+            renderTrack (s.tracks[(size_t) trackIndex], out, true);
+    }
+    //== media pool preview: mixed in ahead of the master chain (so the master fader and its
+    //   inserts apply) and only in the realtime callback, so a mixdown or a stem never has it
+    if (ctx.realtime && previewOn.load (std::memory_order_acquire) && ! capturing)
+    {
+        const ScopedTryLock tl (previewLock);
+        if (tl.isLocked() && previewSource != nullptr && previewSource->isPlaying())
+        {
+            previewBuf.clear();
+            AudioSourceChannelInfo pv (&previewBuf, 0, n);
+            previewSource->getNextAudioBlock (pv);
+            out.addFrom (0, 0, previewBuf, 0, 0, n);
+            out.addFrom (1, 0, previewBuf, 1, 0, n);
+        }
+    }
+
+    //== master
+    if (ctx.masterFx)
+    {
+        // master inserts run before the fader unless the slot is marked post-fader
+        auto runMasterChain = [&] (bool post)
+        {
+            for (auto& m : s.master)
+                if (m != nullptr && m->postFader.load() == post)
+                {
+                    auto& p = *m->proc;
+                    AudioBuffer<float> view (out.getArrayOfWritePointers(), 2, 0, n);
+                    masterMidi.clear();
+                    if (m->bypass.load() || m->editorBypass.load()) p.processBlockBypassed (view, masterMidi);
+                    else p.processBlock (view, masterMidi);
+                }
+        };
+        // master automation lanes: the fader curve is handled below, plugin parameters are set
+        // here so the inserts hear them for this block. Like a track, the master follows its
+        // automation mode: Off leaves every lane and the fader curve alone.
+        const bool masterAutoOn = s.masterAutoMode != AutoMode::Off;
+        if (masterAutoOn)
+            for (auto& lane : s.masterParamLanes)      // resolved in buildSnapshot: no map lookup here
+            {
+                const float v = evalAutoLane (lane.points, beatNow);
+                if (std::abs (lane.param->getValue() - v) > 1.0e-4f) lane.param->setValue (v);
+            }
+        runMasterChain (false);
+
+        float mg = masterGain.load();
+        if (masterAutoOn && ! s.masterVolAuto.empty())
+        {
+            // master fader automation: the curve value is a normalised fader position
+            const double beatEnd = beatNow + (double) n / sr * (s.bpm / 60.0);
+            const float a0 = evalAutoLane (s.masterVolAuto, beatNow);
+            const float a1 = evalAutoLane (s.masterVolAuto, beatEnd);
+            mg = masterMute.load() ? 0.0f : faderToGain ((a0 + a1) * 0.5f);
+        }
+        if (lastMasterGain < 0.0f) { lastMasterGain = mg; lastMasterPhase = s.masterPhaseInvert; }
+        const float mgSigned = s.masterPhaseInvert ? -mg : mg;
+        const float lastSigned = lastMasterPhase ? -lastMasterGain : lastMasterGain;
+        out.applyGainRamp (0, 0, n, lastSigned, mgSigned);
+        out.applyGainRamp (1, 0, n, lastSigned, mgSigned);
+        lastMasterGain = mg;
+        lastMasterPhase = s.masterPhaseInvert;
+
+        runMasterChain (true);
+
+        // Studio One style mono check on the main output: average L / R into both channels.
+        // It sits after the (post-fader) master inserts and before the PDC hold-back, so what is
+        // monitored, metered and printed is exactly the mono fold.
+        if (masterMono.load() && out.getNumChannels() >= 2)
+        {
+            auto* ml = out.getWritePointer (0);
+            auto* mr = out.getWritePointer (1);
+            for (int i = 0; i < n; ++i)
+            {
+                const float m = (ml[i] + mr[i]) * 0.5f;
+                ml[i] = m;
+                mr[i] = m;
+            }
+        }
+
+        // the master chain is part of every track's path (buildSnapshot counts it), so its
+        // latency is already compensated by the per-track pads. Only the bypassed master
+        // inserts need a delay of their own to keep the chain time constant.
+        const int mDelay = s.masterFill;
+        if (mDelay > 0 || masterPadApplied != mDelay)
+        {
+            pdcDelay (masterDelayLine, masterDelayWrite, masterPadApplied, masterPadFade, mDelay,
+                      out.getWritePointer (0), out.getWritePointer (1), n);
+        }
+
+        //== listen bus: monitoring only. It runs for the audio device and is deliberately
+        //   skipped for every offline render, so its level and effects never reach an export.
+        if (s.hasListen && ctx.realtime && ! capturing)
+        {
+            auto runListenChain = [&] (bool post)
+            {
+                for (auto& m : s.listen)
+                    if (m != nullptr && m->postFader.load() == post)
+                    {
+                        auto& p = *m->proc;
+                        AudioBuffer<float> view (out.getArrayOfWritePointers(), 2, 0, n);
+                        masterMidi.clear();
+                        if (m->bypass.load() || m->editorBypass.load()) p.processBlockBypassed (view, masterMidi);
+                        else p.processBlock (view, masterMidi);
+                    }
+            };
+            runListenChain (false);
+            if (s.listenGain != 1.0f)
+            {
+                if (lastListenGain < 0.0f) lastListenGain = s.listenGain;
+                out.applyGainRamp (0, 0, n, lastListenGain, s.listenGain);
+                out.applyGainRamp (1, 0, n, lastListenGain, s.listenGain);
+            }
+            lastListenGain = s.listenGain;
+            runListenChain (true);
+        }
+    }
+
+    //== metronome
+    if (ctx.realtime && (metroOn.load() || (recording.load() && startPos < recordFrom)) && isPlaying && ! capturing)
+    {
+        metroBuf.clear (0, n);
+        if (metroBuf.getNumChannels() > 1) metroBuf.clear (1, 0, n);
+
+        int starts[64]; bool accents[64];
+        int nStarts = 0;
+        for (int si = 0; si < nseg; ++si)
+        {
+            const int64 a = segs[si].start, b = segs[si].start + segs[si].len;
+            // enumerate the integer beats inside this segment through the tempo map
+            const int64 k0 = (int64) std::ceil (tempomap::secondsToBeats (tempo, (double) a / sr) - 1.0e-9);
+            const double bLimit = tempomap::secondsToBeats (tempo, (double) b / sr);
+            for (int64 k = k0; nStarts < 64; ++k)
+            {
+                const double bs = (double) k;
+                if (bs >= bLimit - 1.0e-9) break;
+                const int64 sp = (int64) std::llround (tempomap::beatsToSeconds (tempo, bs) * sr);
+                if (sp >= b) break;
+                if (sp >= a)
+                {
+                    starts[nStarts] = segs[si].off + (int) (sp - a);
+                    accents[nStarts] = std::abs (tempomap::barStartAtOrBefore (tempo, jmax (0.0, bs)) - bs) < 1.0e-6;
+                    ++nStarts;
+                }
+            }
+        }
+        int next = 0;
+        auto* ml = metroBuf.getWritePointer (0);
+        auto* mr = metroBuf.getWritePointer (1);
+        for (int i = 0; i < n; ++i)
+        {
+            while (next < nStarts && starts[next] == i)
+            {
+                metroRemaining = (int) (0.035 * sr);
+                metroFreq = accents[next] ? 1700.0f : 1100.0f;
+                metroPhase = 0.0f;
+                ++next;
+            }
+            if (metroRemaining > 0)
+            {
+                const float env = (float) metroRemaining / (float) (0.035 * sr);
+                const float v = std::sin (metroPhase) * env * env * 0.4f;
+                metroPhase += MathConstants<float>::twoPi * metroFreq / (float) sr;
+                ml[i] += v; mr[i] += v;
+                --metroRemaining;
+            }
+        }
+        // the click bypasses every delay ring (it is added after master processing), so it has
+        // to be held back by the whole source-to-output latency to stay on the grid
+        const int metroDelay = s.maxPdc;
+        if (metroDelay > 0 || metroPadApplied != metroDelay)
+        {
+            pdcDelay (metroDelayLine, metroDelayWrite, metroPadApplied, metroPadFade, metroDelay, ml, mr, n);
+            FloatVectorOperations::add (out.getWritePointer (0), ml, n);
+            FloatVectorOperations::add (out.getWritePointer (1), mr, n);
+        }
+        else
+        {
+            FloatVectorOperations::add (out.getWritePointer (0), ml, n);
+            FloatVectorOperations::add (out.getWritePointer (1), mr, n);
+        }
+    }
+
+    if (ctx.realtime)
+    {
+        const float pl = out.getMagnitude (0, 0, n), pr = out.getMagnitude (1, 0, n);
+        if (pl > masterPeakL.load()) masterPeakL.store (pl);
+        if (pr > masterPeakR.load()) masterPeakR.store (pr);
+        if (pl > 1.0f || pr > 1.0f) masterClipped.store (true);
+
+        double sl = 0.0, sr = 0.0;
+        const auto* l0 = out.getReadPointer (0);
+        const auto* r0 = out.getReadPointer (1);
+        for (int i = 0; i < n; ++i) { sl += (double) l0[i] * l0[i]; sr += (double) r0[i] * r0[i]; }
+        masterRmsAccL.store (masterRmsAccL.load() + (float) sl);
+        masterRmsAccR.store (masterRmsAccR.load() + (float) sr);
+        masterRmsCount.store (masterRmsCount.load() + n);
+
+        // goniometer: decimate the master output into the ring
+        static int scopePos = 0;
+        const int step = jmax (1, n / 64);
+        for (int i = 0; i < n; i += step)
+        {
+            scopeL[(size_t) scopePos].store (l0[i]);
+            scopeR[(size_t) scopePos].store (r0[i]);
+            scopePos = (scopePos + 1) % kScopePairs;
+        }
+    }
+}
+
+//==============================================================================
+void Engine::timerCallback()
+{
+    // an offline render thread owns the model / plug-ins while it runs: do not touch them here
+    if (exporting.load()) return;
+
+    // Coalesced snapshot rebuild: run it at most once per debounce window, however many change
+    // notifications arrived in between (see requestSnapshotRebuild). The rebuild is the single
+    // most expensive message-thread job during playback, so this is what keeps the UI responsive
+    // when a plug-in / automation stream floods it.
+    if (snapshotRebuildPending.load (std::memory_order_acquire))
+    {
+        const juce::uint32 now = Time::getMillisecondCounter();
+        if ((juce::uint32) (now - snapshotRebuildRequestMs.load (std::memory_order_relaxed)) >= kSnapshotDebounceMs)
+        {
+            snapshotRebuildPending.store (false, std::memory_order_relaxed);
+            handleAsyncUpdate();
+        }
+    }
+
+    // give the (exclusive) audio driver back to the system while nothing needs it
+    releaseDeviceIfIdle();
+
+    pumpControllerFifo();
+
+    // Wheel / external-CC writes have no explicit mouse-up: commit them once the control has
+    // stopped moving for a moment, so each gesture becomes one automation edit.
+    if (! touches.empty())
+    {
+        const double now = Time::getMillisecondCounterHiRes();
+        for (size_t i = touches.size(); i-- > 0;)
+        {
+            auto& r = touches[i];
+            if (! r.implicit || now - r.lastMs < 350.0) continue;
+            const int tid = r.trackId;
+            const String target = r.target;
+            commitTouch (tid, target);       // erases the touch
+            if (auto it = runtimes.find (tid); it != runtimes.end()
+                && (target == "vol" || target == "pan"))
+                it->second->touched = 0;
+            else if (target.startsWith ("p:"))
+            {
+                const auto parts = StringArray::fromTokens (target, ":", "");
+                if (parts.size() >= 3)
+                    if (auto inst = getInstance (parts[1].getLargeIntValue()))
+                        inst->touchedParam = -1;
+            }
+        }
+    }
+
+    // release stale snapshot objects on the message thread
+    if (! hasPending.load())
+    {
+        SpinLock::ScopedTryLockType l (snapLock);
+        if (l.isLocked() && ! hasPending.load()) pending.reset();
+    }
+
+    if (midiRecording.load())
+    {
+        const auto scope = recFifo.read (recFifo.getNumReady());
+        for (int i = 0; i < scope.blockSize1; ++i) recEvents.push_back (recFifoData[(size_t) (scope.startIndex1 + i)]);
+        for (int i = 0; i < scope.blockSize2; ++i) recEvents.push_back (recFifoData[(size_t) (scope.startIndex2 + i)]);
+    }
+
+    if (! auditions.empty())
+    {
+        const double now = Time::getMillisecondCounterHiRes();
+        for (size_t i = auditions.size(); i-- > 0;)
+            if (auditions[i].offAt <= now)
+            {
+                noteOff (auditions[i].note);
+                auditions.erase (auditions.begin() + (long long) i);
+            }
+    }
+}
+
+//==============================================================================
+void Engine::ensureRuntimes()
+{
+    std::set<int> alive;
+    for (auto& t : project.tracks)
+    {
+        alive.insert (t->id);
+        if (runtimes.find (t->id) == runtimes.end())
+        {
+            auto rt = std::make_shared<TrackRuntime>();
+            rt->trackId = t->id;
+            rt->lastGainL = rt->lastGainR = -1.0f;
+            runtimes[t->id] = rt;
+        }
+    }
+    for (auto it = runtimes.begin(); it != runtimes.end();)
+        it = alive.count (it->first) ? std::next (it) : runtimes.erase (it);
+}
+
+void Engine::syncMixToRuntimes()
+{
+    bool solo = false, sendSolo = false;
+    for (auto& t : project.tracks)
+    {
+        auto it = runtimes.find (t->id);
+        if (it == runtimes.end()) continue;
+        auto& rt = *it->second;
+        rt.volNorm = gainToFader (Decibels::decibelsToGain (t->volumeDb, -99.0f));
+        if (t->volumeDb <= -99.0f) rt.volNorm = 0.0f;
+        rt.pan = t->pan;
+        rt.mute = t->mute;
+        rt.solo = t->solo;
+        rt.listenSolo = t->listenSolo;
+        rt.arm = t->arm;
+        rt.monitor = t->monitor;
+        rt.isAudio = t->type == TrackType::Audio;
+        rt.midiChannel = t->midiChannel;
+        rt.inputChannel = t->inputChannel;
+        rt.inputMono = t->inputMono;
+        const bool explicitSolo = t->solo && ! t->mute;
+        rt.soloExplicit = explicitSolo;
+        // soloing an effect return needs a different gate in renderChunk: the tracks feeding it
+        // keep rendering (with their dry output muted) so the return has a signal
+        sendSolo = sendSolo || (explicitSolo && t->isSend());
+        solo = solo || t->solo;
+        if (t->hasInstrument)
+            if (auto inst = getInstance (t->instrument.uid)) inst->bypass = t->instrument.bypass;
+        for (auto& s : t->extraInstruments)
+            if (auto inst = getInstance (s.uid)) inst->bypass = s.bypass;
+        for (auto& s : t->inserts)
+            if (auto inst = getInstance (s.uid)) inst->bypass = s.bypass;
+    }
+    for (auto& s : project.masterTrack.inserts)
+        if (auto inst = getInstance (s.uid)) { inst->bypass = s.bypass; inst->postFader = s.postFader; }
+    anySolo = solo;
+    anySoloSend = sendSolo;
+
+    // a bus / effect return must stay audible when something feeding it is soloed, otherwise
+    // soloing a track inside a group would silence the very group it plays through. Walk the
+    // routing downstream until nothing new is fed, so a return routed through a bus (and that bus
+    // through another) stays audible at every stage, not only the first one.
+    if (solo)
+    {
+        std::set<int> audibleIds;
+        for (auto& t : project.tracks)
+            if (t->solo && ! t->mute) audibleIds.insert (t->id);
+        bool grew = true;
+        while (grew)
+        {
+            grew = false;
+            for (auto& t : project.tracks)
+            {
+                if (t == nullptr || t->mute || audibleIds.count (t->id) == 0) continue;
+                if (t->outputBusId != 0 && audibleIds.insert (t->outputBusId).second) grew = true;
+                for (auto& s : t->sends) if (audibleIds.insert (s.target).second) grew = true;
+            }
+        }
+        for (auto& t : project.tracks)
+            if (t->isGroupTrack() && audibleIds.count (t->id) > 0)
+                if (auto it = runtimes.find (t->id); it != runtimes.end())
+                    it->second->solo = true;
+    }
+
+    //== effect-return solo: which tracks have to keep rendering (with their dry output muted) so
+    // an explicitly soloed Send track still receives the sends feeding it. Walk the routing
+    // backwards from the soloed returns: a track is needed when its dry output or one of its
+    // sends lands on a track that is already needed. This runs on the message thread so the audio
+    // thread never walks the routing graph and never allocates.
+    {
+        std::set<int> needed;
+        if (sendSolo)
+        {
+            for (auto& t : project.tracks)
+                if (t->isSend() && t->solo && ! t->mute) needed.insert (t->id);
+            bool grew = true;
+            while (grew)
+            {
+                grew = false;
+                for (auto& t : project.tracks)
+                {
+                    if (t == nullptr || t->mute || needed.count (t->id) > 0) continue;
+                    bool feeds = t->outputBusId != 0 && needed.count (t->outputBusId) > 0;
+                    if (! feeds)
+                        for (auto& s : t->sends)
+                            if (needed.count (s.target) > 0) { feeds = true; break; }
+                    // an output channel needs its instrument track rendered: it plays a pair of
+                    // that track's plug-in output, so a needed channel drags its parent in (dry
+                    // muted) as well
+                    if (! feeds)
+                        for (auto& c : project.tracks)
+                            if (c->sourceTrack == t->id && needed.count (c->id) > 0) { feeds = true; break; }
+                    if (feeds && needed.insert (t->id).second) grew = true;
+                }
+            }
+        }
+        for (auto& t : project.tracks)
+            if (auto it = runtimes.find (t->id); it != runtimes.end())
+                it->second->feedNeeded = needed.count (t->id) > 0;
+    }
+    {
+        auto* lb = project.listenBus();
+        const bool listening = lb != nullptr && lb->listenEnabled;
+        bool anyListenTrack = false;
+        for (auto& t : project.tracks)
+            if (t != nullptr && t->listenSolo) anyListenTrack = true;
+        anyListenSolo.store (listening && anyListenTrack);
+        for (auto& [uid, inst] : instances) { (void) uid; (void) inst; }
+    }
+    masterMute.store (project.masterTrack.mute);
+    masterMono.store (project.masterTrack.mono);
+    masterGain = project.masterTrack.mute ? 0.0f : Decibels::decibelsToGain (project.masterTrack.volumeDb, -99.0f);
+    if (project.masterTrack.volumeDb <= -99.0f) masterGain = 0.0f;
+    metroOn = project.metronome;
+}
+
+std::shared_ptr<PluginInstance> Engine::getInstance (int64 uid) const
+{
+    auto it = instances.find (uid);
+    return it == instances.end() ? nullptr : it->second;
+}
+
+//==============================================================================
+//== MIDI learn
+void Engine::setLearnTarget (const MidiTarget& t, const String& label)
+{
+    learning = t.kind != MidiTargetKind::None;
+    learnTarget = t;
+    learningLabel = label;
+    midiLearnOn.store (learning || ! project.midiMappings.empty(), std::memory_order_release);
+    if (onMidiMappingChanged) onMidiMappingChanged();
+}
+
+void Engine::cancelLearn()
+{
+    if (! learning) return;
+    learning = false;
+    learnTarget = {};
+    learningLabel = {};
+    midiLearnOn.store (! project.midiMappings.empty(), std::memory_order_release);
+    if (onMidiMappingChanged) onMidiMappingChanged();
+}
+
+int Engine::applyController (int channel, int cc, int value, bool isNote)
+{
+    const float norm = jlimit (0.0f, 1.0f, value / 127.0f);
+
+    //== learning: this event becomes a mapping for the armed target, and it is applied right away
+    //   (turning a knob while learning should also move what it was just assigned to)
+    bool learnedOne = false;
+    if (learning)
+    {
+        if (isNote && learnTarget.kind != MidiTargetKind::Metronome
+                   && learnTarget.kind != MidiTargetKind::TransportPlayStop)
+            return 0;                            // a knob target needs a CC, not a button
+
+        MidiMapping m;
+        m.target = learnTarget;
+        m.cc = cc;
+        m.channel = jlimit (0, 16, channel);
+        m.isNote = isNote;
+        m.label = learningLabel;
+
+        project.checkpoint();
+        // the same controller movement re-learns its old target instead of piling up
+        auto& v = project.midiMappings;
+        v.erase (std::remove_if (v.begin(), v.end(),
+                                 [&] (const MidiMapping& o) { return o.cc == cc && o.isNote == isNote
+                                                                 && (o.channel == m.channel || o.channel == 0 || m.channel == 0); }),
+                 v.end());
+        v.push_back (m);
+        project.sendContentChanged();
+        learning = false;
+        learnTarget = {};
+        learningLabel = {};
+        midiLearnOn.store (true, std::memory_order_release);
+        learnedOne = true;
+    }
+
+    int moved = 0;
+    bool mixChanged = false, contentChanged = false;
+    for (auto& m : project.midiMappings)
+    {
+        if (m.cc != cc || m.isNote != isNote) continue;
+        if (m.channel != 0 && m.channel != channel) continue;
+
+        switch (m.target.kind)
+        {
+            case MidiTargetKind::MasterVolume:
+                project.masterTrack.volumeDb = norm <= 0.0f ? -100.0f
+                                                           : Decibels::gainToDecibels (faderToGain (norm));
+                mixChanged = true;
+                break;
+            case MidiTargetKind::TrackVolume:
+                if (auto* t = project.findTrack (m.target.trackId))
+                {
+                    t->volumeDb = norm <= 0.0f ? -100.0f : Decibels::gainToDecibels (faderToGain (norm));
+                    touchValueAuto (t->id, "vol", norm);
+                    mixChanged = true;
+                }
+                break;
+            case MidiTargetKind::TrackPan:
+                if (auto* t = project.findTrack (m.target.trackId))
+                {
+                    t->pan = panFromNorm (norm);
+                    touchValueAuto (t->id, "pan", norm);
+                    mixChanged = true;
+                }
+                break;
+            case MidiTargetKind::PluginParam:
+                if (auto inst = getInstance (m.target.uid))
+                    if (inst->proc != nullptr)
+                    {
+                        auto& params = inst->proc->getParameters();
+                        if (m.target.paramIndex >= 0 && m.target.paramIndex < params.size())
+                            if (auto* p = params[m.target.paramIndex])
+                            {
+                                p->setValueNotifyingHost (norm);
+                                if (inst->ownerTrack >= 0)
+                                    touchValueAuto (inst->ownerTrack,
+                                                    "p:" + String (inst->uid) + ":" + String (m.target.paramIndex),
+                                                    norm);
+                                mixChanged = true;
+                            }
+                    }
+                break;
+            case MidiTargetKind::Metronome:
+                if (value > 63)
+                {
+                    project.metronome = ! project.metronome;
+                    contentChanged = true;
+                }
+                break;
+            case MidiTargetKind::TransportPlayStop:
+                if (value > 63) { if (isPlaying()) stop(); else play(); }
+                break;
+            default: continue;
+        }
+        ++moved;
+    }
+
+    if (contentChanged) project.sendContentChanged();
+    if (mixChanged) project.sendMixChanged();
+    if ((moved > 0 || learnedOne) && onMidiMappingChanged) onMidiMappingChanged();
+    return learnedOne ? jmax (1, moved) : moved;
+}
+
+void Engine::pumpControllerFifo()
+{
+    if (! midiLearnOn.load (std::memory_order_acquire)) return;
+    const auto scope = ccFifo.read (ccFifo.getNumReady());
+    for (int i = 0; i < scope.blockSize1; ++i)
+    {
+        const auto e = ccData[(size_t) (scope.startIndex1 + i)];
+        applyController (e.channel, e.cc, e.value, e.isNote);
+    }
+    for (int i = 0; i < scope.blockSize2; ++i)
+    {
+        const auto e = ccData[(size_t) (scope.startIndex2 + i)];
+        applyController (e.channel, e.cc, e.value, e.isNote);
+    }
+}
+
+//==============================================================================
+//== media pool preview
+bool Engine::startPreview (const File& file, String& error)
+{
+    stopPreview();
+    ensureDeviceOpen();                  // the preview plays through the device callback
+
+    std::unique_ptr<AudioFormatReader> reader (formats.createReaderFor (file));
+    if (reader == nullptr)
+    {
+        error = TRANS ("This file cannot be played.");
+        return false;
+    }
+
+    const ScopedLock sl (previewLock);
+    const double readerRate = jmax (1.0, reader->sampleRate);
+    const double readerLength = (double) reader->lengthInSamples / readerRate;
+    previewReader = std::make_unique<AudioFormatReaderSource> (reader.release(), true);
+    previewLength = readerLength;
+
+    // prepare before setSource: the transport derives the resampling ratio from its own sample
+    // rate, and an unprepared transport would divide by zero in the audio thread
+    const double deviceRate = sampleRate > 0.0 ? sampleRate : 44100.0;
+    previewSource = std::make_unique<AudioTransportSource>();
+    previewSource->prepareToPlay (deviceRate, TrackRuntime::kMaxBlock);
+    previewSource->setSource (previewReader.get(), 32768, &previewThread, readerRate, 2);
+    previewSource->setGain (1.0);
+    previewSource->setPosition (0.0);
+    previewSource->start();
+    previewOn.store (previewSource->isPlaying(), std::memory_order_release);
+    return previewOn.load();
+}
+
+void Engine::stopPreview()
+{
+    const ScopedLock sl (previewLock);
+    previewOn.store (false, std::memory_order_release);
+    if (previewSource != nullptr)
+    {
+        previewSource->stop();
+        previewSource->setSource (nullptr);
+        previewSource->releaseResources();
+    }
+    previewSource.reset();
+    previewReader.reset();
+    previewLength = 0.0;
+}
+
+bool Engine::isPreviewActive() const
+{
+    return previewOn.load (std::memory_order_acquire);
+}
+
+double Engine::previewPositionSeconds() const
+{
+    const ScopedLock sl (previewLock);
+    return previewSource != nullptr ? previewSource->getCurrentPosition() : 0.0;
+}
+
+double Engine::previewProgress() const
+{
+    const ScopedLock sl (previewLock);
+    if (previewSource == nullptr || previewLength <= 0.0) return -1.0;
+    return jlimit (0.0, 1.0, previewSource->getCurrentPosition() / previewLength);
+}
+
+//==============================================================================
+void Engine::configureBuses (AudioProcessor& p, bool instrument)
+{
+    if (instrument)
+    {
+        // A multi-output instrument publishes every output it has (a sampler with 16 outs, or the
+        // aux out of SX Synth); enabling only the main pair would leave the extra channels silent.
+        // Input buses stay off - a plug-in instrument does not record.
+        for (int i = 0; i < p.getBusCount (true); ++i)
+            if (auto* b = p.getBus (true, i); b != nullptr && ! b->isMain())
+                b->enable (false);
+
+        int totalOut = 0;
+        for (int i = 0; i < p.getBusCount (false); ++i)
+        {
+            auto* b = p.getBus (false, i);
+            if (b == nullptr) continue;
+
+            // the layout the plug-in asks for, as long as the runtime buffer has room (64 channels)
+            const int want = jmax (1, b->getDefaultLayout().size());
+            if (b->isMain())
+            {
+                if (b->isNumberOfChannelsSupported (2)) b->setNumberOfChannels (2);
+                b->enable (true);
+                totalOut += (int) b->getCurrentLayout().size();
+                continue;
+            }
+            if (totalOut + want > TrackRuntime::kChannels) { b->enable (false); continue; }
+            if (b->isNumberOfChannelsSupported (want)) b->setNumberOfChannels (want);
+            b->enable (true);
+            totalOut += (int) b->getCurrentLayout().size();
+        }
+        return;
+    }
+
+    for (int i = 0; i < p.getBusCount (true); ++i)
+    {
+        auto* b = p.getBus (true, i);
+        if (b == nullptr) continue;
+        if (i == 0 && ! instrument)
+        {
+            if (b->isNumberOfChannelsSupported (2)) b->setNumberOfChannels (2);
+            b->enable (true);
+        }
+        else if (b->isNumberOfChannelsSupported (0) || ! b->isMain())
+            b->enable (false);
+    }
+    // Only the main output is mixed, but auxiliary outputs stay enabled: some VST3 instruments
+    // (e.g. multi-output samplers) write to every bus regardless of its activation state.
+    if (auto* b = p.getBus (false, 0))
+    {
+        if (b->isNumberOfChannelsSupported (2)) b->setNumberOfChannels (2);
+        b->enable (true);
+    }
+}
+
+bool Engine::trackRendersAra (int trackId)
+{
+    auto it = runtimes.find (trackId);
+    return it != runtimes.end() && it->second != nullptr && it->second->araActive.load();
+}
+
+std::shared_ptr<PluginInstance> Engine::createInstanceImpl (PluginSlot& slot, int ownerTrack, String& error)
+{
+    // The renderer always hands a plug-in up to TrackRuntime::kMaxBlock samples per processBlock:
+    // the device callback chunks at kMaxBlock and the offline renders use full kMaxBlock blocks.
+    // Preparing a new instance for the smaller device block would let a plug-in that sizes its
+    // internal buffers from the reported block size be fed a bigger block than it asked for, so
+    // instances are always prepared for the maximum.
+    const int prepareBlock = jmax (deviceBlock, TrackRuntime::kMaxBlock);
+    trace ("create " + slot.desc.name + " sr=" + String (sampleRate) + " block=" + String (prepareBlock));
+    auto inst = std::make_shared<PluginInstance>();
+    // the delay slot also carries builtIn = true, so it has to be tested first - otherwise
+    // a built-in effect would silently load the built-in synth
+    if (isBuiltInDelay (slot.desc))
+        inst->proc = std::make_unique<BuiltInDelay>();
+    else if (isBuiltInEffect (slot.desc))
+        inst->proc = createBuiltInEffect (builtInEffectKind (slot.desc));
+    else if (isBuiltInSampler (slot.desc))
+        inst->proc = std::make_unique<BuiltInSampler>();
+    else if (slot.builtIn || isBuiltInSynth (slot.desc))
+        inst->proc = std::make_unique<BuiltInSynth>();
+    else
+    {
+        auto p = plugins.create (slot.desc, sampleRate, prepareBlock, error);
+        if (p == nullptr) return nullptr;
+        inst->proc = std::move (p);
+    }
+
+    inst->uid = slot.uid;
+    inst->ownerTrack = ownerTrack;
+    inst->name = slot.desc.name;
+    inst->isInstrument = slot.desc.isInstrument;
+    inst->engine = this;
+    inst->bypass = slot.bypass;
+    // built-in effects can show the name of their track (the SX Stereo room lists every track by name);
+    // read at call time, so a renamed or moved track is right the next time
+    if (auto* fx = dynamic_cast<SxEffectBase*> (inst->proc.get()))
+    {
+        auto* raw = inst.get();
+        fx->trackNameSource = [this, raw]
+        {
+            if (raw->ownerTrack < 0) return String ("Master");
+            const auto* t = project.findTrack (raw->ownerTrack);
+            return t != nullptr ? t->name : String();
+        };
+    }
+
+    auto& p = *inst->proc;
+    trace ("  instance created, in=" + String (p.getTotalNumInputChannels()) + " out=" + String (p.getTotalNumOutputChannels())
+           + " buses in=" + String (p.getBusCount (true)) + " out=" + String (p.getBusCount (false)));
+    p.setPlayHead (this);
+    p.setRateAndBufferSizeDetails (sampleRate, prepareBlock);
+    configureBuses (p, inst->isInstrument);
+    trace ("  buses configured, in=" + String (p.getTotalNumInputChannels()) + " out=" + String (p.getTotalNumOutputChannels()));
+
+    // ARA: a plug-in that declares ARA gets the audio clips of its track as an ARA document
+    // (Melodyne & co read the files and the timeline directly instead of capturing the insert
+    // stream). ARA demands that the document exists and the regions are added *before* the
+    // plug-in is prepared - binding a running plug-in is a crash - so for an ARA insert the
+    // first prepareToPlay is deferred into the (asynchronous) factory callback.
+    bool araPending = false;
+    if (AraHost::isAvailable() && araInsertsEnabled() && slot.desc.hasARAExtension && ownerTrack > 0)
+    {
+        auto* track = project.findTrack (ownerTrack);
+        auto* audioPlugin = dynamic_cast<juce::AudioPluginInstance*> (&p);
+        if (track != nullptr && audioPlugin != nullptr && track->type == TrackType::Audio
+            && ! track->audioClips.empty())
+        {
+            inst->ara = std::make_unique<AraHost>();
+            std::weak_ptr<PluginInstance> weak = inst;
+            inst->ara->attach (*audioPlugin, "SoundX " + slot.desc.name, [weak] (bool ok)
+            {
+                auto sp = weak.lock();
+                if (sp == nullptr || sp->engine == nullptr) return;
+                auto* ap = dynamic_cast<juce::AudioPluginInstance*> (sp->proc.get());
+                if (ap == nullptr) return;
+                if (ok)
+                {
+                    sp->ara->sync (sp->engine->project, sp->ownerTrack);
+                    if (auto* tr = sp->engine->project.findTrack (sp->ownerTrack))
+                        if (auto* slot = tr->findSlot (sp->uid))
+                            sp->ara->restoreArchive (slot->araState);
+                    if (auto it = sp->engine->runtimes.find (sp->ownerTrack); it != sp->engine->runtimes.end() && it->second != nullptr)
+                        it->second->araActive = true;
+                }
+                // the plug-in has been waiting for its document: arm it now. The engine may have
+                // changed rate / device buffer since the insert, so read the maximum block from
+                // the engine rather than replaying the captured creation-time value.
+                ap->prepareToPlay (sp->engine->sampleRate,
+                                   jmax (sp->engine->deviceBlock, TrackRuntime::kMaxBlock));
+            });
+            araPending = true;
+        }
+    }
+
+    if (! araPending)
+        p.prepareToPlay (sampleRate, prepareBlock);
+    trace ("  prepared");
+    if (slot.state.getSize() > 0)
+        p.setStateInformation (slot.state.getData(), (int) slot.state.getSize());
+    // the latency a plug-in reports depends on its state (oversampling, lookahead, loaded
+    // impulse responses...), so it is read after the state has been restored
+    {
+        int lat = 0;
+        try { lat = jmax (0, p.getLatencySamples()); } catch (...) {}
+        inst->latencySamples.store (lat);
+    }
+    p.addListener (inst.get());
+
+    trace ("  ready");
+    return inst;
+}
+
+std::shared_ptr<PluginInstance> Engine::createInstance (PluginSlot& slot, int ownerTrack, String& error)
+{
+    try
+    {
+        return createInstanceImpl (slot, ownerTrack, error);
+    }
+    catch (const std::exception& e)
+    {
+        error = TRANS ("Plug-in crashed during load: ") + String (e.what());
+        return nullptr;
+    }
+    catch (...)
+    {
+        error = TRANS ("Plug-in crashed during load (unknown exception)");
+        return nullptr;
+    }
+}
+
+void Engine::reconcilePlugins()
+{
+    std::set<int64> keep, failed;
+    auto ensure = [&] (PluginSlot& s, int ownerTrack)
+    {
+        auto it = instances.find (s.uid);
+        if (it != instances.end()) { keep.insert (s.uid); it->second->ownerTrack = ownerTrack; return; }
+        String err;
+        if (auto inst = createInstance (s, ownerTrack, err))
+        {
+            keep.insert (s.uid);
+            instances[s.uid] = inst;
+        }
+        else
+        {
+            failed.insert (s.uid);
+            if (onError)
+                onError (TRANS ("Failed to load plug-in") + " \"" + s.desc.name + "\": " + err);
+        }
+    };
+
+    for (auto& t : project.tracks)
+    {
+        if (t->hasInstrument) ensure (t->instrument, t->id);
+        for (auto& s : t->extraInstruments) ensure (s, t->id);
+        for (auto& s : t->inserts) ensure (s, t->id);
+    }
+    for (auto& s : project.masterTrack.inserts) ensure (s, -1);
+
+    // drop slots whose plug-in could not be created, after iterating
+    if (! failed.empty())
+    {
+        auto drop = [&failed] (std::vector<PluginSlot>& v)
+        {
+            v.erase (std::remove_if (v.begin(), v.end(), [&failed] (const PluginSlot& x) { return failed.count (x.uid) > 0; }), v.end());
+        };
+        for (auto& t : project.tracks)
+        {
+            drop (t->extraInstruments);
+            if (t->hasInstrument && failed.count (t->instrument.uid))
+            {
+                // the failed layer may be the track's first instrument: promote another one
+                if (! t->extraInstruments.empty())
+                {
+                    t->instrument = t->extraInstruments.front();
+                    t->extraInstruments.erase (t->extraInstruments.begin());
+                }
+                else
+                    t->hasInstrument = false;
+            }
+            drop (t->inserts);
+        }
+        drop (project.masterTrack.inserts);
+
+        // refresh the UI later; never notify synchronously from here (it would re-enter this function)
+        MessageManager::callAsync ([this] { project.sendMixChanged(); project.sendContentChanged(); });
+    }
+
+    destroyInstancesNotIn (keep);
+}
+
+void Engine::destroyInstancesNotIn (const std::set<int64>& keep)
+{
+    for (auto it = instances.begin(); it != instances.end();)
+    {
+        if (keep.count (it->first) == 0)
+        {
+            if (onSlotRemoved) onSlotRemoved (it->first);
+            it = instances.erase (it);
+        }
+        else
+            ++it;
+    }
+}
+
+void Engine::captureStates()
+{
+    auto grab = [this] (PluginSlot& s)
+    {
+        if (auto inst = getInstance (s.uid))
+        {
+            try
+            {
+                s.state.reset();
+                inst->proc->getStateInformation (s.state);
+                s.bypass = inst->bypass.load();
+            }
+            catch (...) {}
+        }
+    };
+    for (auto& t : project.tracks)
+    {
+        if (t->hasInstrument) grab (t->instrument);
+        for (auto& s : t->extraInstruments) grab (s);
+        for (auto& s : t->inserts) grab (s);
+    }
+    for (auto& s : project.masterTrack.inserts) grab (s);
+}
+
+void Engine::captureParams (std::map<int64, std::vector<float>>& out)
+{
+    out.clear();
+    for (auto& [uid, inst] : instances)
+    {
+        if (inst == nullptr || inst->proc == nullptr) continue;
+        auto& params = inst->proc->getParameters();
+        if (params.isEmpty()) continue;
+
+        std::vector<float> values ((size_t) params.size(), 0.0f);
+        for (int i = 0; i < params.size(); ++i)
+            if (auto* p = params[i])
+                values[(size_t) i] = p->getValue();
+        out[uid] = std::move (values);
+    }
+}
+
+void Engine::captureStatesFor (const std::set<int64>& uids, std::map<int64, MemoryBlock>& out)
+{
+    out.clear();
+    for (auto uid : uids)
+    {
+        auto inst = getInstance (uid);
+        if (inst == nullptr || inst->proc == nullptr) continue;
+
+        MemoryBlock mb;
+        try { inst->proc->getStateInformation (mb); } catch (...) { continue; }
+        if (mb.getSize() > 0)
+        {
+            out[uid] = mb;
+            // keep the model's copy in step as well: a freeze moves the slot out of the live
+            // chain, and unfreeze (or a redo) restores the plug-in from exactly this state
+            if (auto* slot = project.findSlotByUid (uid))
+            {
+                slot->state = mb;
+                slot->bypass = inst->bypass.load();
+            }
+        }
+
+        // the ARA document lives in the plug-in, so it has to be archived here as well
+        if (inst->araBound())
+            if (auto* tr = project.findTrack (inst->ownerTrack))
+                if (auto* slot = tr->findSlot (uid))
+                    slot->araState = inst->ara->archive();
+    }
+}
+
+void Engine::applyParams (const std::map<int64, std::vector<float>>& values)
+{
+    for (auto& [uid, wanted] : values)
+    {
+        auto inst = getInstance (uid);
+        if (inst == nullptr || inst->proc == nullptr) continue;
+
+        auto& params = inst->proc->getParameters();
+        const int n = jmin (params.size(), (int) wanted.size());
+        for (int i = 0; i < n; ++i)
+        {
+            auto* p = params[i];
+            if (p == nullptr) continue;
+            const float v = jlimit (0.0f, 1.0f, wanted[(size_t) i]);
+            if (std::abs (p->getValue() - v) < 1.0e-6f) continue;   // nothing moved: keep the plug-in quiet
+            p->setValueNotifyingHost (v);
+        }
+    }
+}
+
+//==============================================================================
+std::shared_ptr<Snap> Engine::buildSnapshot()
+{
+    // tracks added without an explicit structure notification would otherwise
+    // silently drop out of every render path - create their runtimes here
+    ensureRuntimes();
+    auto s = std::make_shared<Snap>();
+    s->tempo = project.tempo;
+    if (s->tempo.empty()) s->tempo.push_back (TempoSegment {});
+    s->bpm = s->tempo.front().bpm;
+    s->tsNum = s->tempo.front().tsNum;
+    s->tsDen = s->tempo.front().tsDen;
+    s->loopOn = project.loopOn;
+    s->loopStartBeat = project.loopStart;
+    s->loopEndBeat = project.loopEnd;
+
+    for (auto& tp : project.tracks)
+    {
+        // a stand-alone automation track is not an audio channel: it has no runtime, no
+        // regions and no bus. Its curve is folded into the channel it controls below.
+        if (tp->isAutomation()) continue;
+
+        auto rtIt = runtimes.find (tp->id);
+        if (rtIt == runtimes.end()) continue;
+
+        TrackSnap ts;
+        ts.rt = rtIt->second;
+        ts.autoMode = tp->autoMode;
+        ts.phaseInvert = tp->phaseInvert;
+        ts.hasOutputChildren = project.numOutputChannels (tp->id) > 0;
+        const int ch = jlimit (1, 16, tp->midiChannel);
+
+        // manual latency compensation: shift the whole track in time (positive = later)
+        const double delaySec = tp->delayMs / 1000.0;
+        const double spb = jmax (1.0e-4, tempomap::beatsToSeconds (s->tempo, 1.0) - tempomap::beatsToSeconds (s->tempo, 0.0));
+        const double delayBeats = delaySec / spb;
+
+        // frozen tracks play their pre-rendered audio; the instrument and the baked insert chain
+        // stay idle. Live inserts added after the freeze and the automation lanes are kept: they
+        // process the frozen audio like any other source.
+        const bool frozenNow = tp->frozen && tp->frozenData != nullptr;
+        ts.frozen = frozenNow;
+        ts.frozenLatency = frozenNow ? jmax (0, tp->frozenBakedLatency) : 0;
+        if (frozenNow)
+        {
+            AudioRegionSnap fr;
+            fr.startBeat = tp->frozenStartBeat;
+            fr.lengthSec = tp->frozenData->lengthSeconds();
+            fr.offsetSec = 0.0;
+            fr.gain = 1.0f;
+            fr.data = tp->frozenData;
+            ts.regions.push_back (fr);
+        }
+
+        struct Tmp { double beat; int order; MidiMessage msg; };
+        std::vector<Tmp> tmp;
+        if (! frozenNow)
+        for (auto& c : tp->midiClips)
+        {
+            if (c.muted) continue;
+            if (c.takeGroup != 0 && ! c.takeActive) continue;   // a take that is not selected stays silent
+            std::vector<const Note*> ordered;
+            for (auto& n : c.notes)
+                if (! (n.start >= c.length || n.start < 0.0)) ordered.push_back (&n);
+            std::stable_sort (ordered.begin(), ordered.end(),
+                              [] (const Note* a, const Note* b) { return a->start < b->start; });
+            int prevPitch = -1;
+            for (auto* np : ordered)
+            {
+                const auto& n = *np;
+                const double on = c.start + n.start;
+                const double off = c.start + jmin (n.start + n.length, c.length);
+                const int note = jlimit (0, 127, n.pitch);
+                tmp.push_back ({ on, 2, MidiMessage::noteOn (ch, note, (uint8) jlimit (1, 127, n.velocity)) });
+                tmp.push_back ({ jmax (on + 1.0e-4, off), 0, MidiMessage::noteOff (ch, note) });
+
+                // FL-style slide note: start the voice with a pitch offset from the previous note,
+                // then bend to the written pitch over the note. RPN 0 sets a 24-semitone range so
+                // the glide can span an octave (and is reset to 2 semitones afterwards).
+                if (n.slide && prevPitch >= 0)
+                {
+                    auto cc = [&] (int num, int val, double beat, int order)
+                    {
+                        tmp.push_back ({ beat, order, MidiMessage::controllerEvent (ch, num, val) });
+                    };
+                    auto bend = [&] (double semis, double beat)
+                    {
+                        const int v = jlimit (0, 16383, 8192 + (int) std::lround (jlimit (-24.0, 24.0, semis) / 24.0 * 8192.0));
+                        tmp.push_back ({ beat, 1, MidiMessage::pitchWheel (ch, v) });
+                    };
+                    cc (101, 0, on, 1); cc (100, 0, on, 1); cc (6, 24, on, 1);
+                    bend ((double) (prevPitch - note), on);
+                    const int steps = 8;
+                    for (int k = 1; k <= steps; ++k)
+                    {
+                        const double t = (double) k / (double) steps;
+                        const double beat = on + (off - on) * t;
+                        bend ((double) (prevPitch - note) * (1.0 - t), beat);
+                    }
+                    cc (101, 0, off, 1); cc (100, 0, off, 1); cc (6, 2, off, 1);
+                    tmp.push_back ({ off, 1, MidiMessage::pitchWheel (ch, 8192) });
+                }
+                prevPitch = note;
+            }
+            // controllers: the very same helper the MIDI export uses, so a pitch bend rests in the
+            // middle outside the part of the clip it was actually drawn in
+            std::vector<std::pair<double, MidiMessage>> ccEvents;
+            appendControllerMessages (c, ch, ccEvents);
+            for (auto& e : ccEvents)
+                tmp.push_back ({ c.start + e.first, 1, e.second });
+        }
+        std::stable_sort (tmp.begin(), tmp.end(), [] (const Tmp& a, const Tmp& b)
+                          { return a.beat != b.beat ? a.beat < b.beat : a.order < b.order; });
+        ts.events.reserve (tmp.size());
+        for (auto& t : tmp)
+        {
+            const double b = t.beat + delayBeats;
+            ts.events.push_back ({ b, tempomap::beatsToSeconds (s->tempo, b), t.msg });
+        }
+
+        struct RegSpan { double s, e; int idx; };
+        std::vector<RegSpan> spans;
+        // an ARA bound plug-in renders this track's audio itself (Melodyne & co), so playing the
+        // raw clips on top of it would double the material
+        const bool araRenders = trackRendersAra (tp->id);
+        if (! frozenNow && ! araRenders)
+        for (auto& c : tp->audioClips)
+        {
+            if (c.data == nullptr || c.muted) continue;
+            if (c.takeGroup != 0 && ! c.takeActive) continue;   // a take that is not selected stays silent
+            // speed / pitch are rendered off line (cached on the clip); reverse is done per sample
+            const bool rendered = ensureClipPlayback (c) && c.rendered != nullptr;
+            AudioRegionSnap r;
+            r.startBeat = c.start + delayBeats; r.lengthSec = c.lengthSec;
+            r.offsetSec = rendered ? 0.0 : c.offsetSec;
+            r.reversed = c.reversed;
+            r.gain = Decibels::decibelsToGain (c.gainDb);
+            r.fadeIn = c.fadeIn;
+            r.fadeOut = c.fadeOut;
+            r.fadeInCurve = c.fadeInCurve;
+            r.fadeOutCurve = c.fadeOutCurve;
+            r.xfadeCurve = jlimit (0, 2, c.xfadeCurve);
+            r.data = rendered ? std::shared_ptr<const AudioData> (c.rendered)
+                              : std::shared_ptr<const AudioData> (c.data);
+            r.gainEnv = c.gainEnv;
+            spans.push_back ({ tempomap::beatsToSeconds (s->tempo, r.startBeat),
+                               tempomap::beatsToSeconds (s->tempo, r.startBeat) + c.lengthSec,
+                               (int) ts.regions.size() });
+            ts.regions.push_back (r);
+        }
+
+        // overlapping audio clips are crossfaded automatically (equal power, like a DAW)
+        if (spans.size() > 1)
+        {
+            std::sort (spans.begin(), spans.end(), [] (const RegSpan& a, const RegSpan& b) { return a.s < b.s; });
+            for (size_t i = 0; i + 1 < spans.size(); ++i)
+            {
+                const auto& a = spans[i];
+                const auto& b = spans[i + 1];
+                const double ovEnd = jmin (a.e, b.e);
+                if (ovEnd <= b.s + 1.0e-6) continue;
+                auto& ra = ts.regions[(size_t) a.idx];
+                auto& rb = ts.regions[(size_t) b.idx];
+                ra.xfadeStart = jmax (0.0, b.s - a.s);
+                ra.xfadeEnd = ovEnd - a.s;
+                ra.xfadeOut = true;
+                rb.xfadeStart = 0.0;
+                rb.xfadeEnd = ovEnd - b.s;
+                rb.xfadeOut = false;
+                rb.xfadeCurve = ra.xfadeCurve;   // both halves share the earlier clip's curve
+            }
+        }
+
+        if (tp->hasInstrument && ! frozenNow) ts.instrument = getInstance (tp->instrument.uid);
+        if (! frozenNow)
+            for (auto& sl : tp->extraInstruments)
+                if (auto inst = getInstance (sl.uid))
+                {
+                    InstrumentSnap is;
+                    is.inst = inst;
+                    is.gain = Decibels::decibelsToGain (sl.gainDb, -99.0f);
+                    is.pan = jlimit (-1.0f, 1.0f, sl.pan);
+                    ts.extraInstruments.push_back (is);
+                }
+        // a frozen track keeps its *live* insert chain (the baked one lives in frozenChain and is
+        // restored by unfreeze): effects inserted after the freeze must keep working
+        for (auto& sl : tp->inserts)
+        if (auto inst = getInstance (sl.uid))
+        {
+            inst->postFader = sl.postFader;
+            ts.inserts.push_back (inst);
+            ts.insertSidechain.push_back (sl.sidechainTrack);
+            // resolve the side-chain source runtime here, on the message thread: the render
+            // threads must not look it up in Engine::runtimes, which this thread mutates
+            std::shared_ptr<TrackRuntime> scRt;
+            if (sl.sidechainTrack != 0)
+                if (auto it = runtimes.find (sl.sidechainTrack); it != runtimes.end())
+                    scRt = it->second;
+            ts.insertSidechainRt.push_back (std::move (scRt));
+        }
+    if (tp->isListenBus) ts.sends.clear();      // the monitor bus is the last stage: no sends
+
+        // automation is never frozen: the lanes stay live so fader / pan / live plug-in
+        // parameters can still be automated (and edited) on a frozen track
+        for (auto& lane : tp->lanes)
+        {
+            LaneSnap ls;
+            ls.points = lane.points;
+            for (auto& p : ls.points) p.beat += delayBeats;   // automation moves with the track
+            normalizeAutoPoints (ls.points);                 // monotone curve, one value per beat
+            if (lane.target == "vol") ls.kind = LaneSnap::Vol;
+            else if (lane.target == "pan") ls.kind = LaneSnap::Pan;
+            else if (lane.target.startsWith ("p:"))
+            {
+                ls.kind = LaneSnap::Param;
+                auto parts = StringArray::fromTokens (lane.target, ":", "");
+                if (parts.size() < 3) continue;
+                ls.inst = getInstance (parts[1].getLargeIntValue());
+                ls.paramIndex = parts[2].getIntValue();
+                if (ls.inst == nullptr) continue;
+                auto& params = ls.inst->proc->getParameters();
+                if (ls.paramIndex < 0 || ls.paramIndex >= params.size()) continue;
+                ls.param = params[ls.paramIndex];
+            }
+            else continue;
+            ts.lanes.push_back (std::move (ls));
+        }
+        s->tracks.push_back (std::move (ts));
+    }
+
+    //== routing: output bus / sends, then a render order that respects them
+    {
+        auto runtimeFor = [this] (int id) -> std::shared_ptr<TrackRuntime>
+        {
+            auto it = runtimes.find (id);
+            return it != runtimes.end() ? it->second : nullptr;
+        };
+        for (auto& tp : project.tracks)
+        {
+            // snapshots are built in track order, so find the matching entry by runtime id
+            for (auto& ts : s->tracks)
+            {
+                if (ts.rt->trackId != tp->id) continue;
+                ts.isBus = tp->isBus();
+        ts.isListenBus = tp->isListenBus;
+                ts.isSend = tp->isSend();
+                // a frozen output channel plays its own render: it no longer reads the parent's
+                // instrument buffer (which may not even run while the parent is frozen too)
+                const bool childFrozen = tp->frozen && tp->frozenData != nullptr;
+                if (tp->sourceTrack != 0 && ! childFrozen)
+                {
+                    ts.sourceRt = runtimeFor (tp->sourceTrack);
+                    ts.sourceChannel = jmax (0, tp->sourceChannel);
+                }
+                if (auto d = runtimeFor (tp->outputBusId)) ts.dest = d.get();
+                for (auto& sl : tp->sends)
+                {
+                    auto target = runtimeFor (sl.target);
+                    if (target == nullptr || target->trackId == tp->id) continue;
+                    SendSnap sn;
+                    sn.target = target.get();
+                    sn.gain = Decibels::decibelsToGain (sl.levelDb, -99.0f);
+                    sn.pre = sl.preFader;
+                    ts.sends.push_back (sn);
+                }
+                break;
+            }
+        }
+
+        // stable topological order: a track that feeds another (dry or via a send) comes first.
+        // cycles fall back to track order so nothing is ever dropped.
+        const int n = (int) s->tracks.size();
+        std::vector<bool> done ((size_t) n, false);
+        s->order.clear();
+        s->order.reserve ((size_t) n);
+        while ((int) s->order.size() < n)
+        {
+            bool progressed = false;
+            for (int i = 0; i < n; ++i)
+            {
+                if (done[(size_t) i]) continue;
+                auto* rtI = s->tracks[(size_t) i].rt.get();
+                const auto& self = s->tracks[(size_t) i];
+                bool ready = true;
+                for (int j = 0; j < n && ready; ++j)
+                {
+                    if (j == i || done[(size_t) j]) continue;
+                    const auto& other = s->tracks[(size_t) j];
+                    if (other.dest == rtI) { ready = false; break; }
+                    // an output channel needs its instrument track rendered before it
+                    if (self.sourceRt.get() == other.rt.get()) { ready = false; break; }
+                    for (auto& sn : other.sends) if (sn.target == rtI) { ready = false; break; }
+                }
+                if (ready) { s->order.push_back (i); done[(size_t) i] = true; progressed = true; }
+            }
+            if (! progressed)
+                for (int i = 0; i < n; ++i)
+                    if (! done[(size_t) i]) { s->order.push_back (i); done[(size_t) i] = true; }
+        }
+    }
+
+    //== multi-core levels ======================================================================
+    // Build the dependency levels here, on the message thread: the render callback must not
+    // allocate (that is what produced the random stutter), so it only walks these vectors.
+    // Tracks in one level never read another track's output; buses / sends / side-chains /
+    // multi-output children naturally land in a later level. A cycle or a dependency that is
+    // not earlier in the render order disables parallel rendering for this snapshot.
+    {
+        const int n = (int) s->tracks.size();
+        bool ok = n >= 2;
+        std::vector<std::vector<int>> deps ((size_t) n);
+        std::unordered_map<int, int> indexOf;
+        indexOf.reserve ((size_t) n * 2);
+        for (int i = 0; i < n; ++i)
+            indexOf[s->tracks[(size_t) i].rt->trackId] = i;
+        auto depIndex = [&] (int trackId) -> int
+        {
+            auto it = indexOf.find (trackId);
+            return it != indexOf.end() ? it->second : -1;
+        };
+
+        for (int i = 0; i < n && ok; ++i)
+        {
+            const auto& ts = s->tracks[(size_t) i];
+            if (ts.isListenBus) continue;       // monitor bus: its inserts run after the master
+            if (ts.dest != nullptr)
+            {
+                const int d = depIndex (ts.dest->trackId);
+                if (d < 0) { ok = false; break; }
+                deps[(size_t) d].push_back (i);
+            }
+            for (auto& sn : ts.sends)
+                if (sn.target != nullptr)
+                {
+                    const int d = depIndex (sn.target->trackId);
+                    if (d < 0) { ok = false; break; }
+                    deps[(size_t) d].push_back (i);
+                }
+            if (! ok) break;
+            if (ts.sourceRt != nullptr)
+            {
+                const int d = depIndex (ts.sourceRt->trackId);
+                if (d < 0) { ok = false; break; }
+                deps[(size_t) i].push_back (d);
+            }
+            for (int src : ts.insertSidechain)
+                if (src != 0)
+                {
+                    const int d = depIndex (src);
+                    if (d < 0) { ok = false; break; }
+                    deps[(size_t) i].push_back (d);
+                }
+        }
+
+        std::vector<int> level ((size_t) n, -1);
+        int maxLevel = -1;
+        if (ok)
+            for (int trackIndex : s->order)
+            {
+                if (trackIndex < 0 || trackIndex >= n) { ok = false; break; }
+                if (s->tracks[(size_t) trackIndex].isListenBus) { level[(size_t) trackIndex] = 0; continue; }
+                int l = 0;
+                for (int d : deps[(size_t) trackIndex])
+                {
+                    if (d < 0 || level[(size_t) d] < 0) { ok = false; break; }
+                    l = jmax (l, level[(size_t) d] + 1);
+                }
+                if (! ok) break;
+                level[(size_t) trackIndex] = l;
+                maxLevel = jmax (maxLevel, l);
+            }
+        if (ok)
+            for (int i = 0; i < n; ++i)
+                if (level[(size_t) i] < 0 && ! s->tracks[(size_t) i].isListenBus) { ok = false; break; }
+        if (ok)
+        {
+            s->levels.resize ((size_t) maxLevel + 1);
+            for (int trackIndex : s->order)
+                if (! s->tracks[(size_t) trackIndex].isListenBus)
+                    s->levels[(size_t) level[(size_t) trackIndex]].push_back (trackIndex);
+        }
+        else
+            s->levels.clear();
+    }
+
+    for (auto& sl : project.masterTrack.inserts)
+        if (auto inst = getInstance (sl.uid)) s->master.push_back (inst);
+    // the master bus uses the same lane model as a track: "vol" is the fader curve, "p:..."
+    // lanes drive master insert parameters
+    s->masterLanes = project.masterTrack.lanes;
+    s->masterAutoMode = project.masterTrack.autoMode;
+    s->masterPhaseInvert = project.masterTrack.phaseInvert;
+    for (auto& lane : s->masterLanes)
+    {
+        normalizeAutoPoints (lane.points);
+        if (lane.target == "vol") s->masterVolAuto = lane.points;
+    }
+
+    //== stand-alone automation tracks ==========================================================
+    // One lane per automation track, applied exactly like an inline lane of the channel it
+    // controls. The channel's own automation mode still decides whether it is read, and the
+    // channel's manual latency offset moves the curve with the audio.
+    for (auto& tp : project.tracks)
+    {
+        if (tp == nullptr || ! tp->isAutomation() || tp->autoMode == AutoMode::Off) continue;
+        auto* lane = tp->automationLane();
+        if (lane == nullptr || lane->points.empty()) continue;
+
+        const double targetDelaySec = [&]
+        {
+            if (auto* target = project.findTrack (tp->autoTargetTrack))
+                return target->delayMs / 1000.0;
+            return 0.0;
+        }();
+        const double spb = jmax (1.0e-4, tempomap::beatsToSeconds (s->tempo, 1.0) - tempomap::beatsToSeconds (s->tempo, 0.0));
+        const double delayBeats = targetDelaySec / spb;
+
+        if (tp->autoTargetTrack == 0)
+        {
+            // the master automation list keeps the full lane (AutoLane), like the inline lanes
+            AutoLane masterLane = *lane;
+            for (auto& p : masterLane.points) p.beat += delayBeats;
+            normalizeAutoPoints (masterLane.points);
+            if (masterLane.target == "vol") s->masterVolAuto = masterLane.points;
+            else if (! masterLane.target.startsWith ("p:")) continue;
+            if (masterLane.points.size() < 2) continue;
+            s->masterLanes.push_back (std::move (masterLane));
+            continue;
+        }
+
+        LaneSnap ls;
+        ls.points = lane->points;
+        for (auto& p : ls.points) p.beat += delayBeats;
+        normalizeAutoPoints (ls.points);
+        if (lane->target == "vol") ls.kind = LaneSnap::Vol;
+        else if (lane->target == "pan") ls.kind = LaneSnap::Pan;
+        else if (lane->target.startsWith ("p:"))
+        {
+            ls.kind = LaneSnap::Param;
+            auto parts = StringArray::fromTokens (lane->target, ":", "");
+            if (parts.size() < 3) continue;
+            ls.inst = getInstance (parts[1].getLargeIntValue());
+            ls.paramIndex = parts[2].getIntValue();
+            if (ls.inst == nullptr) continue;
+            auto& params = ls.inst->proc->getParameters();
+            if (ls.paramIndex < 0 || ls.paramIndex >= params.size()) continue;
+            ls.param = params[ls.paramIndex];
+        }
+        else continue;
+
+        for (auto& target : s->tracks)
+            if (target.rt != nullptr && target.rt->trackId == tp->autoTargetTrack)
+            {
+                target.lanes.push_back (std::move (ls));
+                break;
+            }
+    }
+
+    //== master plug-in parameter automation ====================================================
+    // The master lanes still carry their target string ("p:<uid>:<index>"). Resolve the plug-in
+    // and parameter pointer once here (message thread) so the audio thread only has to walk
+    // plain pointers: looking a plug-in up in Engine::instances from the render thread while the
+    // message thread inserts / removes plug-ins would be a data race on the std::map.
+    for (auto& lane : s->masterLanes)
+    {
+        if (! lane.target.startsWith ("p:") || lane.points.size() < 2) continue;
+        auto parts = StringArray::fromTokens (lane.target, ":", "");
+        if (parts.size() < 3) continue;
+        const int64 laneUid = parts[1].getLargeIntValue();
+        bool onMaster = false;
+        for (auto& m : s->master) if (m != nullptr && m->uid == laneUid) { onMaster = true; break; }
+        if (! onMaster) continue;       // a stale lane that no longer points at a master insert
+        Snap::MasterParamLane mp;
+        mp.inst = getInstance (laneUid);
+        if (mp.inst == nullptr) continue;
+        auto& params = mp.inst->proc->getParameters();
+        const int idx = parts[2].getIntValue();
+        if (idx < 0 || idx >= params.size()) continue;
+        mp.param = params[idx];
+        mp.points = lane.points;
+        s->masterParamLanes.push_back (std::move (mp));
+    }
+
+    if (auto* lb = project.listenBus())
+    {
+        s->hasListen = lb->listenEnabled;      // switched off = master goes straight out
+        s->listenGain = lb->mute ? 0.0f : Decibels::decibelsToGain (lb->volumeDb, -99.0f);
+        if (lb->volumeDb <= -99.0f) s->listenGain = 0.0f;
+        for (auto& sl : lb->inserts)
+            if (auto inst = getInstance (sl.uid)) s->listen.push_back (inst);
+    }
+
+    //== plug-in delay compensation totals
+    {
+        const int n = (int) s->tracks.size();
+        std::vector<int> own ((size_t) n, 0), fill ((size_t) n, 0), down ((size_t) n, -1), path ((size_t) n, 0);
+        // an output channel inherits the whole chain of the instrument track it plays through:
+        // the instrument itself plus the parent's inserts (they run on every output pair)
+        std::vector<int> parentOwn ((size_t) n, 0), parentFill ((size_t) n, 0);
+
+        // 1) the latency of each track's own chain. Bypassed plug-ins are counted too: the
+        //    host delays by exactly that amount instead (see `fill`), so toggling bypass never
+        //    moves a track in time and never makes the delay lines replay old material.
+        for (int i = 0; i < n; ++i)
+        {
+            auto& ts = s->tracks[(size_t) i];
+            auto addPlugin = [&] (const std::shared_ptr<PluginInstance>& p)
+            {
+                if (p == nullptr) return;
+                const int lat = jmax (0, p->latencySamples.load());
+                own[(size_t) i] += lat;
+                if (p->bypass.load() || p->editorBypass.load()) fill[(size_t) i] += lat;
+            };
+            addPlugin (ts.instrument);
+            for (auto& ins : ts.inserts) addPlugin (ins);
+            // a frozen render already contains the latency of the instrument and of the insert
+            // chain that was baked into it: the frozen file plays that late, so it has to be
+            // counted like a plug-in for delay compensation to line the track up again
+            own[(size_t) i] += ts.frozenLatency;
+            parentOwn[(size_t) i] = own[(size_t) i];
+            parentFill[(size_t) i] = fill[(size_t) i];
+        }
+
+        // master chain latency and the part of it that is currently bypassed
+        int masterLat = 0;
+        for (auto& m : s->master)
+            if (m != nullptr)
+            {
+                const int lat = jmax (0, m->latencySamples.load());
+                masterLat += lat;
+                if (m->bypass.load() || m->editorBypass.load()) s->masterFill += lat;
+            }
+
+        auto indexOfRuntime = [&] (const TrackRuntime* rt) -> int
+        {
+            for (int i = 0; i < n; ++i) if (s->tracks[(size_t) i].rt.get() == rt) return i;
+            return -1;
+        };
+
+        // 2) how much latency still follows a track's output: the bus it plays through, that
+        //    bus' own chain and finally the master chain. Memoised, cycle safe.
+        std::function<int (int, int)> downOf = [&] (int i, int depth) -> int
+        {
+            if (i < 0) return masterLat;
+            if (down[(size_t) i] >= 0) return down[(size_t) i];
+            if (depth > n + 2) return masterLat;
+
+            down[(size_t) i] = masterLat;                 // provisional value breaks cycles
+            const auto* dest = s->tracks[(size_t) i].dest;
+            if (dest != nullptr)
+            {
+                const int j = indexOfRuntime (dest);
+                if (j >= 0) down[(size_t) i] = own[(size_t) j] + downOf (j, depth + 1);
+            }
+            return down[(size_t) i];
+        };
+
+        // 3) the alignment base: the longest source-to-master path in the project
+        std::vector<int> inheritedLat ((size_t) n, 0);
+        int maxPath = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            auto& ts = s->tracks[(size_t) i];
+            if (ts.isListenBus) { path[(size_t) i] = 0; continue; }   // monitoring only
+
+            // an output channel's audio has already been through the chain of the instrument
+            // track it plays from (instrument + that track's inserts)
+            int inherited = 0;
+            if (ts.sourceRt != nullptr)
+                for (int j = 0; j < n; ++j)
+                    if (s->tracks[(size_t) j].rt.get() == ts.sourceRt.get())
+                    {
+                        inherited = parentOwn[(size_t) j];
+                        fill[(size_t) i] += parentFill[(size_t) j];   // bypassed plug-ins there are covered by the host delay
+                        break;
+                    }
+            inheritedLat[(size_t) i] = inherited;
+
+            path[(size_t) i] = own[(size_t) i] + inherited + downOf (i, 0);
+            maxPath = jmax (maxPath, path[(size_t) i]);
+        }
+        maxPath = jmin (maxPath, TrackRuntime::kPdcCap - 1);
+
+        // 4) the delay each track needs. A bus is fed by tracks that were already padded for
+        //    its latency, so a bus only compensates its own bypassed plug-ins.
+        for (int i = 0; i < n; ++i)
+        {
+            auto& ts = s->tracks[(size_t) i];
+            // ownPdc is the latency from this track's *source* to its output: an output channel
+            // inherits the parent's chain, which the export / freeze lead calculation needs
+            ts.ownPdc = own[(size_t) i] + inheritedLat[(size_t) i];
+            ts.fillPdc = fill[(size_t) i];
+            ts.pdc = jmin (path[(size_t) i], TrackRuntime::kPdcCap - 1);
+
+            const bool hasInput = ts.isBus || ts.isSend;
+            const int pad = (hasInput ? 0 : maxPath - ts.pdc) + ts.fillPdc;
+            ts.pad = jlimit (0, TrackRuntime::kPdcCap - 1, pad);
+        }
+
+        // 5) sends tap the source before its pad, so a latency plug-in on the return has to be
+        //    compensated on the send itself: the tap time is the source's own chain for a normal
+        //    track, and "maxPath - down" for a bus / return (its input is already aligned).
+        for (int i = 0; i < n; ++i)
+        {
+            auto& ts = s->tracks[(size_t) i];
+            if (ts.sends.empty()) continue;
+
+            const bool hasInput = ts.isBus || ts.isSend;
+            const int tapLat = hasInput ? jmax (0, maxPath - down[(size_t) i]) : own[(size_t) i];
+
+            for (size_t k = 0; k < ts.sends.size(); ++k)
+            {
+                auto& sn = ts.sends[k];
+                if (sn.target == nullptr) continue;
+                const int j = indexOfRuntime (sn.target);
+                if (j < 0) continue;
+
+                const int wetPath = own[(size_t) j] + downOf (j, 0);
+                const int pad = (maxPath - tapLat - wetPath) + fill[(size_t) j];
+                sn.pad = jlimit (0, TrackRuntime::kPdcCap - 1, pad);
+
+                if (sn.pad > 0)
+                {
+                    // one delay line per send, reused across snapshots (the map lives on the
+                    // message thread; the snapshot holds a reference so the audio thread is safe)
+                    const auto key = std::make_pair (ts.rt->trackId, (int) k);
+                    auto& state = sendDelays[key];
+                    if (state == nullptr) state = std::make_shared<SendDelayState>();
+                    sn.delay = state;
+                }
+                else
+                    sn.delay.reset();
+            }
+        }
+
+        s->maxPdc = maxPath;
+        s->masterPdc = jmin (masterLat, TrackRuntime::kPdcCap - 1);
+        s->masterFill = jmin (s->masterFill, TrackRuntime::kPdcCap - 1);
+        pdcTotalSamples.store (s->maxPdc);      // every track is delayed by this much in total
+    }
+
+    // the audio thread only needs to look at controllers when there is something to do with them
+    midiLearnOn.store (learning || ! project.midiMappings.empty(), std::memory_order_release);
+    return s;
+}
+
+void Engine::publish (std::shared_ptr<Snap> s)
+{
+    {
+        SpinLock::ScopedLockType l (snapLock);
+        pending = s;
+        hasPending.store (true, std::memory_order_release);
+    }
+    editSnap = s;
+    audioSnap.store (s, std::memory_order_release);
+}
+
+void Engine::requestSnapshotRebuild()
+{
+    if (exporting.load())
+    {
+        deferredAsyncUpdate.store (true);
+        return;
+    }
+    // Thread-safe: the timestamp is only a hint, the message-thread timer decides when to run.
+    snapshotRebuildRequestMs.store (Time::getMillisecondCounter(), std::memory_order_relaxed);
+    snapshotRebuildPending.store (true, std::memory_order_release);
+}
+
+void Engine::handleAsyncUpdate()
+{
+    // never rebuild a snapshot next to an offline render that is reading the same sources
+    if (exporting.load())
+    {
+        deferredAsyncUpdate.store (true);
+        return;
+    }
+    snapshotRebuildPending.store (false, std::memory_order_relaxed);
+
+    // keep the playhead on the same musical beat when the tempo map changes
+    if (! lastTempo.empty() && project.tempo != lastTempo)
+    {
+        const double beat = tempomap::secondsToBeats (lastTempo, (double) posSamples.load() / sampleRate);
+        posSamples.store (project.beatToSamples (beat, sampleRate));
+    }
+    lastTempo = project.tempo;
+    lastBpm = project.bpm;
+    syncMixToRuntimes();
+    publish (buildSnapshot());
+}
+
+void Engine::projectContentChanged()
+{
+    if (exporting.load()) { deferredAsyncUpdate.store (true); return; }
+    resyncAraDocuments();
+    requestSnapshotRebuild();
+}
+
+// Keeps the ARA documents in step with the clips: moving, trimming or adding a clip has to move the
+// playback regions the plug-in sees. Regions may only be touched while the plug-in is unprepared,
+// so this only runs when the transport is stopped and re-arms the plug-ins afterwards.
+void Engine::resyncAraDocuments()
+{
+    if (isPlaying()) return;
+
+    for (auto& entry : instances)
+    {
+        auto& inst = entry.second;
+        if (inst == nullptr || ! inst->araBound()) continue;
+        auto* api = dynamic_cast<juce::AudioPluginInstance*> (inst->proc.get());
+        if (api == nullptr) continue;
+        api->releaseResources();
+        inst->ara->sync (project, inst->ownerTrack);
+        // same max-block rule as createInstanceImpl: the renderer may feed full kMaxBlock blocks
+        api->prepareToPlay (sampleRate, jmax (deviceBlock, TrackRuntime::kMaxBlock));
+    }
+}
+
+void Engine::projectMixChanged()
+{
+    if (exporting.load()) { deferredAsyncUpdate.store (true); return; }
+    syncMixToRuntimes();
+}
+
+void Engine::projectStructureChanged()
+{
+    // a structure edit can only come from the message thread; while an offline render thread is
+    // reading the plug-ins / runtimes it has to wait (the render ends and syncs everything then)
+    if (exporting.load()) { deferredStructure.store (true); deferredAsyncUpdate.store (true); return; }
+    reconcilePlugins();
+    ensureRuntimes();
+    syncMixToRuntimes();
+    triggerAsyncUpdate();
+}
+
+void Engine::syncAll()
+{
+    reconcilePlugins();
+    ensureRuntimes();
+    lastBpm = project.bpm;
+    lastTempo = project.tempo;
+    syncMixToRuntimes();
+    cancelPendingUpdate();
+    publish (buildSnapshot());
+}
+
+//==============================================================================
+bool Engine::addInstrument (int trackId, const PluginDescription& d, String& error)
+{
+    auto* t = project.findTrack (trackId);
+    if (t == nullptr || t->type != TrackType::Instrument) return false;
+
+    PluginSlot slot;
+    slot.uid = makeUid();
+    slot.desc = d;
+    slot.builtIn = isBuiltInSynth (d) || isBuiltInSampler (d);
+    auto inst = createInstance (slot, trackId, error);
+    if (inst == nullptr) return false;
+
+    project.checkpoint();
+    if (! t->hasInstrument)
+    {
+        t->hasInstrument = true;
+        t->instrument = slot;
+    }
+    else
+        t->extraInstruments.push_back (slot);
+
+    instances[slot.uid] = inst;
+    project.sendStructureChanged();
+    return true;
+}
+
+bool Engine::setInstrument (int trackId, const PluginDescription& d, String& error)
+{
+    auto* t = project.findTrack (trackId);
+    if (t == nullptr || t->type != TrackType::Instrument) return false;
+
+    PluginSlot slot;
+    slot.uid = makeUid();
+    slot.desc = d;
+    slot.builtIn = isBuiltInSynth (d) || isBuiltInSampler (d);
+    auto inst = createInstance (slot, trackId, error);
+    if (inst == nullptr) return false;
+
+    // the instrument that is replaced can be brought back by undo: keep its sound, not only its name
+    const int64 replacedUid = (t->hasInstrument && t->instrument.uid != slot.uid) ? t->instrument.uid : 0;
+    project.checkpointRemoving ({ replacedUid });
+
+    t->hasInstrument = true;
+    t->instrument = slot;
+    instances[slot.uid] = inst;
+    project.sendStructureChanged();
+    return true;
+}
+
+bool Engine::addInsert (int trackId, const PluginDescription& d, String& error)
+{
+    PluginSlot slot;
+    slot.uid = makeUid();
+    slot.desc = d;
+    auto inst = createInstance (slot, trackId, error);
+    if (inst == nullptr) return false;
+
+    project.checkpoint();
+    if (trackId < 0) project.masterTrack.inserts.push_back (slot);
+    else if (auto* t = project.findTrack (trackId)) t->inserts.push_back (slot);
+    else return false;
+    instances[slot.uid] = inst;
+    project.sendStructureChanged();
+    return true;
+}
+
+bool Engine::replaceInsertChain (int trackId, const std::vector<PluginSlot>& chain, String& error)
+{
+    std::vector<PluginSlot>* destination = nullptr;
+    if (trackId < 0)
+        destination = &project.masterTrack.inserts;
+    else if (auto* t = project.findTrack (trackId))
+        destination = &t->inserts;
+
+    if (destination == nullptr)
+    {
+        error = TRANS ("Track not found.");
+        return false;
+    }
+
+    // Load every plug-in first: a missing / broken plug-in then leaves the current chain alone
+    // instead of half-replacing it.
+    std::vector<PluginSlot> newSlots;
+    std::vector<std::shared_ptr<PluginInstance>> newInstances;
+    newSlots.reserve (chain.size());
+    newInstances.reserve (chain.size());
+
+    for (auto source : chain)
+    {
+        PluginSlot slot = std::move (source);
+        slot.uid = makeUid();
+        slot.araState.reset();       // an ARA archive belongs to the source track's clips
+
+        String why;
+        auto inst = createInstance (slot, trackId, why);
+        if (inst == nullptr)
+        {
+            error = "\"" + slot.desc.name + "\": " + (why.isNotEmpty() ? why : TRANS ("failed to load"));
+            return false;
+        }
+
+        newSlots.push_back (std::move (slot));
+        newInstances.push_back (std::move (inst));
+    }
+
+    // The old plug-ins have to be in the checkpoint with their sound: undoing the load must
+    // bring the old chain back, not a row of empty default plug-ins.
+    std::set<int64> oldUids;
+    for (auto& slot : *destination) oldUids.insert (slot.uid);
+    project.checkpointRemoving (oldUids);
+
+    *destination = std::move (newSlots);
+    for (size_t i = 0; i < newInstances.size(); ++i)
+        instances[(*destination)[i].uid] = std::move (newInstances[i]);
+
+    // The structure listener reconciles the instance map: the new instances are kept, the ones
+    // that are no longer in the project are destroyed (and their windows closed).
+    project.sendStructureChanged();
+    return true;
+}
+
+void Engine::removeSlot (int trackId, int64 uid)
+{
+    // undo has to bring the plug-in back with its settings, which live in the instance that is
+    // about to be destroyed: make the checkpoint carry them
+    project.checkpointRemoving ({ uid });
+
+    if (trackId < 0)
+    {
+        auto& v = project.masterTrack.inserts;
+        v.erase (std::remove_if (v.begin(), v.end(), [uid] (const PluginSlot& s) { return s.uid == uid; }), v.end());
+    }
+    else if (auto* t = project.findTrack (trackId))
+    {
+        // removes a layer instrument, the first one included (a stacked one then takes its place)
+        t->removeInstrument (uid);
+        auto& v = t->inserts;
+        v.erase (std::remove_if (v.begin(), v.end(), [uid] (const PluginSlot& s) { return s.uid == uid; }), v.end());
+        t->lanes.erase (std::remove_if (t->lanes.begin(), t->lanes.end(), [uid] (const AutoLane& l)
+                                        { return l.target.startsWith ("p:" + String (uid) + ":"); }), t->lanes.end());
+        if (t->activeLane.startsWith ("p:" + String (uid) + ":")) t->activeLane = "vol";
+    }
+    project.sendStructureChanged();
+}
+
+void Engine::setSlotBypass (int trackId, int64 uid, bool bypassed)
+{
+    PluginSlot* slot = nullptr;
+    if (trackId < 0)
+    {
+        for (auto& s : project.masterTrack.inserts) if (s.uid == uid) slot = &s;
+    }
+    else if (auto* t = project.findTrack (trackId))
+        slot = t->findSlot (uid);
+    if (slot == nullptr) return;
+    if (slot->bypass == bypassed) return;
+
+    project.checkpoint();       // bypass is a mixing move: Ctrl+Z has to switch it back
+    slot->bypass = bypassed;
+    if (auto inst = getInstance (uid)) inst->bypass = bypassed;
+    project.sendMixChanged();
+    triggerAsyncUpdate();   // rebuild the snapshot: bypass changes the chain latency
+}
+
+void Engine::moveInsert (int trackId, int from, int to)
+{
+    auto* vec = trackId < 0 ? &project.masterTrack.inserts : (project.findTrack (trackId) != nullptr ? &project.findTrack (trackId)->inserts : nullptr);
+    if (vec == nullptr || from < 0 || from >= (int) vec->size() || to < 0 || to >= (int) vec->size() || from == to) return;
+    project.checkpoint();
+    auto s = (*vec)[(size_t) from];
+    vec->erase (vec->begin() + from);
+    vec->insert (vec->begin() + to, s);
+    project.sendStructureChanged();
+}
+
+//==============================================================================
+String Engine::describeParam (const PluginInstance& inst, int index) const
+{
+    auto& params = inst.proc->getParameters();
+    if (index < 0 || index >= params.size()) return {};
+    return inst.name + ": " + params[index]->getName (48);
+}
+
+void Engine::parameterGesture (PluginInstance& inst, int index, bool begin)
+{
+    if (inst.ownerTrack < 0) return;
+    const String target = "p:" + String (inst.uid) + ":" + String (index);
+
+    if (begin)
+    {
+        lastTouched = { inst.uid, index, inst.ownerTrack, describeParam (inst, index) };
+        inst.touchedParam = index;
+        // A knob move is a mixing move, so it gets an undo step like a fader drag does. The
+        // checkpoint holds the values from before the gesture, which is why it has to happen here
+        // and not when the drag ends. A real drag fires begin once, but a self-modulating plug-in
+        // can fire begin/end pairs many times a second; those bursts used to serialise the whole
+        // project to XML on every begin, which froze the UI. Consecutive gestures on the same
+        // parameter inside a short window now share one checkpoint (undo still reverts the burst).
+        const double now = Time::getMillisecondCounterHiRes();
+        auto& last = lastGestureCheckpointMs[std::make_pair (inst.uid, index)];
+        if (now - last >= kGestureCheckpointGapMs)
+        {
+            project.checkpoint();
+            last = now;
+        }
+        touchBegin (inst.ownerTrack, target);
+    }
+    else
+    {
+        touchEnd (inst.ownerTrack, target);
+        inst.touchedParam = -1;
+    }
+}
+
+void Engine::parameterChanged (PluginInstance& inst, int index, float value)
+{
+    if (inst.ownerTrack < 0 || inst.touchedParam.load() != index) return;
+    touchValue (inst.ownerTrack, "p:" + String (inst.uid) + ":" + String (index), value);
+}
+
+void Engine::touchBegin (int trackId, const String& target)
+{
+    auto it = runtimes.find (trackId);
+    auto* t = project.findTrack (trackId);
+    if (it == runtimes.end() || t == nullptr) return;
+    if (target == "vol") it->second->touched = 1;
+    else if (target == "pan") it->second->touched = 2;
+    else if (target.startsWith ("p:"))
+    {
+        const auto parts = StringArray::fromTokens (target, ":", "");
+        if (parts.size() >= 3)
+            if (auto inst = getInstance (parts[1].getLargeIntValue()))
+                inst->touchedParam = parts[2].getIntValue();
+    }
+
+    TouchRec r;
+    r.trackId = trackId;
+    r.target = target;
+    r.startBeat = getPositionBeats();
+    r.recordPoints = playing.load() && t->autoMode == AutoMode::Touch;
+    r.lastMs = Time::getMillisecondCounterHiRes();
+    touches.push_back (std::move (r));
+}
+
+void Engine::touchValueAuto (int trackId, const String& target, float norm)
+{
+    auto* t = project.findTrack (trackId);
+    if (t == nullptr || ! playing.load() || t->autoMode != AutoMode::Touch) return;
+
+    const double now = Time::getMillisecondCounterHiRes();
+    bool found = false;
+    for (auto& r : touches)
+        if (r.trackId == trackId && r.target == target) { r.lastMs = now; found = true; break; }
+    if (! found)
+    {
+        touchBegin (trackId, target);
+        if (! touches.empty())
+        {
+            touches.back().implicit = true;
+            touches.back().lastMs = now;
+        }
+    }
+    touchValue (trackId, target, norm);
+}
+
+void Engine::touchValue (int trackId, const String& target, float norm)
+{
+    const double now = Time::getMillisecondCounterHiRes();
+    for (auto& r : touches)
+        if (r.trackId == trackId && r.target == target && r.recordPoints)
+        {
+            r.lastMs = now;
+            const double b = getPositionBeats();
+            if (! r.pts.empty() && std::abs (r.pts.back().beat - b) < 1.0e-4) r.pts.back().value = norm;
+            else r.pts.push_back ({ b, norm });
+            return;
+        }
+}
+
+void Engine::touchEnd (int trackId, const String& target)
+{
+    commitTouch (trackId, target);
+    auto it = runtimes.find (trackId);
+    if (it != runtimes.end() && (target == "vol" || target == "pan")) it->second->touched = 0;
+}
+
+String Engine::laneLabel (Track& t, const String& target) const
+{
+    if (target == "vol") return "Volume";
+    if (target == "pan") return "Pan";
+    auto parts = StringArray::fromTokens (target, ":", "");
+    if (parts.size() >= 3)
+        if (auto inst = getInstance (parts[1].getLargeIntValue()))
+            return describeParam (*inst, parts[2].getIntValue());
+    juce::ignoreUnused (t);
+    return target;
+}
+
+void Engine::commitTouch (int trackId, const String& target)
+{
+    for (size_t i = 0; i < touches.size(); ++i)
+    {
+        auto& r = touches[i];
+        if (r.trackId != trackId || r.target != target) continue;
+        auto rec = std::move (r);
+        touches.erase (touches.begin() + (long long) i);
+
+        if (rec.pts.empty()) return;
+        auto* t = project.findTrack (trackId);
+        if (t == nullptr) return;
+
+        project.checkpoint();
+        auto& lane = t->ensureLane (target, laneLabel (*t, target));
+        const double t0 = rec.pts.front().beat, t1 = rec.pts.back().beat;
+        lane.points.erase (std::remove_if (lane.points.begin(), lane.points.end(),
+                                           [=] (const AutoPoint& p) { return p.beat >= t0 - 1.0e-6 && p.beat <= t1 + 1.0e-6; }),
+                           lane.points.end());
+        for (auto& p : rec.pts) lane.points.push_back (p);
+        normalizeAutoPoints (lane.points);   // sorted, one value per beat: the curve stays monotone
+        lane.visible = true;   // recorded lanes show up as their own row
+        t->activeLane = target;
+        t->showAutomation = true;
+        project.sendContentChanged();
+        return;
+    }
+}
+
+//==============================================================================
+namespace
+{
+    // MP3 needs an external encoder: ffmpeg.exe or lame.exe (app folder, app data or PATH)
+    File findMp3Encoder()
+    {
+        // ffmpeg / lame are called without the ".exe" on macOS and Linux, and there they live in
+        // /usr/local/bin (Homebrew) - so look for both names and use the platform's PATH separator
+        const StringArray names { "ffmpeg.exe", "lame.exe", "ffmpeg", "lame" };
+        const File appDir = File::getSpecialLocation (File::currentExecutableFile).getParentDirectory();
+        const File dataDir = File::getSpecialLocation (File::userApplicationDataDirectory).getChildFile ("SoundX");
+        for (auto* dir : { &appDir, &dataDir })
+            for (auto& n : names)
+                if (dir->getChildFile (n).existsAsFile()) return dir->getChildFile (n);
+
+        StringArray pathDirs;
+       #if JUCE_WINDOWS
+        const juce_wchar pathListSeparator = ';';
+       #else
+        const juce_wchar pathListSeparator = ':';
+       #endif
+        pathDirs.addTokens (SystemStats::getEnvironmentVariable ("PATH", {}),
+                            String::charToString (pathListSeparator), "\"");
+        for (auto& d : pathDirs)
+            if (d.isNotEmpty())
+                for (auto& n : names)
+                    if (File (d).getChildFile (n).existsAsFile()) return File (d).getChildFile (n);
+        return {};
+    }
+
+    void writeRawWav (const File& f, AudioBuffer<float>& buf, double sr, int bits)
+    {
+        f.deleteFile();
+        WavAudioFormat wav;
+        auto* stream = new FileOutputStream (f);
+        if (! stream->openedOk()) { delete stream; return; }
+        std::unique_ptr<AudioFormatWriter> w (wav.createWriterFor (stream, sr, (unsigned int) buf.getNumChannels(), bits, {}, 0));
+        if (w != nullptr) w->writeFromAudioSampleBuffer (buf, 0, buf.getNumSamples());
+    }
+
+    bool encodeMp3 (const File& out, AudioBuffer<float>& buf, double sr, int kbps, String& error)
+    {
+        const auto enc = findMp3Encoder();
+        if (enc == File())
+        {
+            error = TRANS ("MP3 export needs an encoder: place ffmpeg.exe or lame.exe next to SoundX.exe (or add it to PATH).");
+            return false;
+        }
+
+        const auto tmp = File::getSpecialLocation (File::tempDirectory)
+                             .getChildFile ("soundx_mp3_" + String (Random::getSystemRandom().nextInt (1000000)) + ".wav");
+        writeRawWav (tmp, buf, sr, 24);
+        if (! tmp.existsAsFile()) { error = TRANS ("Could not write the temporary WAV file."); return false; }
+
+        out.deleteFile();
+        StringArray args;
+        if (enc.getFileName().startsWithIgnoreCase ("ffmpeg"))
+            args = { enc.getFullPathName(), "-y", "-loglevel", "error", "-i", tmp.getFullPathName(),
+                     "-b:a", String (kbps) + "k", out.getFullPathName() };
+        else
+            args = { enc.getFullPathName(), "--silent", "-b", String (kbps), tmp.getFullPathName(), out.getFullPathName() };
+
+        ChildProcess p;
+        const bool started = p.start (args);
+        const uint32 code = started ? (p.waitForProcessToFinish (600000) ? p.getExitCode() : 99u) : 98u;
+        tmp.deleteFile();
+        if (! started) { error = TRANS ("Could not run the MP3 encoder."); return false; }
+        if (code != 0 || ! out.existsAsFile() || out.getSize() == 0)
+        {
+            error = TRANS ("MP3 encoding failed (encoder exit code ") + String ((int) code) + ").";
+            return false;
+        }
+        return true;
+    }
+
+    bool writeAudioFile (const File& f, AudioBuffer<float>& buf, double sr, int bits, bool normalize, String& error,
+                         ExportOptions::Format format = ExportOptions::Wav, int mp3Kbps = 320)
+    {
+        const int N = buf.getNumSamples();
+        if (normalize)
+        {
+            const float peak = buf.getMagnitude (0, N);
+            if (peak > 1.0e-6f) buf.applyGain (0.891f / peak);
+        }
+        if (bits < 32)
+        {
+            if (bits == 16)
+            {
+                Random rnd;
+                const float lsb = 1.0f / 32768.0f;
+                for (int c = 0; c < buf.getNumChannels(); ++c)
+                {
+                    auto* d = buf.getWritePointer (c);
+                    for (int i = 0; i < N; ++i)
+                        d[i] += (rnd.nextFloat() - rnd.nextFloat()) * lsb;
+                }
+            }
+            for (int c = 0; c < buf.getNumChannels(); ++c)
+                FloatVectorOperations::clip (buf.getWritePointer (c), buf.getReadPointer (c), -1.0f, 1.0f, N);
+        }
+
+        if (format == ExportOptions::Mp3)
+            return encodeMp3 (f, buf, sr, mp3Kbps, error);
+
+        f.deleteFile();
+
+        // FLAC stores 16 or 24 bit; everything else uses the WAV writer
+        std::unique_ptr<AudioFormat> fmt;
+        int bps = bits;
+        if (format == ExportOptions::Flac)
+        {
+            fmt = std::make_unique<FlacAudioFormat>();
+            bps = bits == 16 ? 16 : 24;
+        }
+        else
+            fmt = std::make_unique<WavAudioFormat>();
+
+        auto* stream = new FileOutputStream (f);
+        if (! stream->openedOk()) { delete stream; error = TRANS ("Cannot write ") + f.getFullPathName(); return false; }
+        std::unique_ptr<AudioFormatWriter> w (fmt->createWriterFor (stream, sr, (unsigned int) buf.getNumChannels(), bps, {}, 0));
+        if (w == nullptr) { delete stream; error = TRANS ("Unsupported export format"); return false; }
+        if (! w->writeFromAudioSampleBuffer (buf, 0, N)) { error = TRANS ("Write failed (disk full?)"); return false; }
+        return true;
+    }
+
+    String extensionFor (ExportOptions::Format f)
+    {
+        return f == ExportOptions::Flac ? ".flac" : f == ExportOptions::Mp3 ? ".mp3" : ".wav";
+    }
+
+    //== offline render sink ====================================================================
+    // Streams a finished offline render (export / freeze) straight into the target file while
+    // the render loop is still producing audio: a background thread flushes every block to disk
+    // (FLAC keeps compressing there too), so the render thread never stops for I/O and the whole
+    // song is never held in RAM twice (render buffer + write pass). Formats that need the whole
+    // signal first (normalizing, MP3) fall back to the previous in-memory path.
+    struct OfflineSink
+    {
+        OfflineSink (const File& targetFile, TimeSliceThread& flushThread, double sampleRateIn, int bitsIn,
+                     ExportOptions::Format fmt, int mp3KbpsIn, bool normalizeIn, String& errorIn)
+            : file (targetFile), flush (flushThread), rate (sampleRateIn), depth (bitsIn),
+              format (fmt), mp3Kbps (mp3KbpsIn), normalize (normalizeIn), error (errorIn) {}
+
+        ~OfflineSink() { threaded.reset(); }   // flushes the buffered audio, finalizes the file
+
+        bool canStream() const { return ! normalize && format != ExportOptions::Mp3; }
+
+        // opens the file and starts streaming; on failure (or for MP3 / normalize) the sink
+        // silently falls back to the in-memory path, which reports its own error at finish()
+        void start (int channels)
+        {
+            acc.clear();
+            written = 0;
+            if (! canStream()) return;
+            file.deleteFile();
+            std::unique_ptr<AudioFormat> fmt2;
+            int bps = depth;
+            if (format == ExportOptions::Flac)
+            {
+                fmt2 = std::make_unique<FlacAudioFormat>();
+                bps = depth == 16 ? 16 : 24;
+            }
+            else
+                fmt2 = std::make_unique<WavAudioFormat>();
+
+            auto* stream = new FileOutputStream (file);
+            if (! stream->openedOk()) { delete stream; return; }
+            std::unique_ptr<AudioFormatWriter> w (fmt2->createWriterFor (stream, rate, (unsigned) channels, bps, {}, 0));
+            if (w == nullptr) { delete stream; return; }
+            // two seconds of FIFO: enough for the flush thread to ride out slow disk moments
+            threaded = std::make_unique<AudioFormatWriter::ThreadedWriter> (w.release(), flush,
+                                                                            (int) jmax (1.0, rate * 2.0));
+        }
+
+        // 16-bit dither and clipping, applied per block on the streaming path (the in-memory
+        // path does both inside writeAudioFile). The sinks are stereo: a multi-target print
+        // hands over a track runtime buffer that can hold many more channels.
+        void condition (AudioBuffer<float>& chunk, int n)
+        {
+            if (threaded == nullptr || depth >= 32) return;
+            const int nch = jmin (2, chunk.getNumChannels());
+            if (depth == 16)
+            {
+                const float lsb = 1.0f / 32768.0f;
+                for (int c = 0; c < nch; ++c)
+                {
+                    auto* d = chunk.getWritePointer (c);
+                    for (int i = 0; i < n; ++i) d[i] += (rnd.nextFloat() - rnd.nextFloat()) * lsb;
+                }
+            }
+            for (int c = 0; c < nch; ++c)
+                FloatVectorOperations::clip (chunk.getWritePointer (c), chunk.getReadPointer (c), -1.0f, 1.0f, n);
+        }
+
+        // 'absStart' is the block's absolute sample position inside the render (the latency
+        // lead-in included); the first 'lead' samples of the render are not written
+        bool write (const AudioBuffer<float>& chunk, int n, int64 absStart, int lead)
+        {
+            const int64 skip = jmax<int64> (0, lead - absStart);
+            if (skip >= n) return true;
+            const int first = (int) skip;
+            const int count = n - first;
+            const int nch = jmin (2, chunk.getNumChannels());
+
+            if (threaded == nullptr)
+            {
+                // in-memory fallback (MP3 / normalize / file could not be opened). The buffer has
+                // to grow for EVERY later block too: testing only the channel count left the
+                // allocation at the size of the first block and every following copy wrote past
+                // its end (heap corruption in normalized exports).
+                const int needed = (int) written + count;
+                if (acc.getNumChannels() < nch || acc.getNumSamples() < needed)
+                    acc.setSize (jmax (nch, acc.getNumChannels()), needed, true, false, true);
+                for (int c = 0; c < nch; ++c)
+                    acc.copyFrom (c, (int) written, chunk, c, first, count);
+                written += count;
+                return true;
+            }
+
+            const float* chans[2] {};
+            for (int c = 0; c < nch; ++c)
+                chans[c] = chunk.getReadPointer (c, first);
+            // the FIFO takes a block all-or-nothing; wait for the flush thread when it is
+            // momentarily full (a slow disk must never lose audio)
+            for (int tries = 0;; ++tries)
+            {
+                if (threaded->write (chans, count)) return true;
+                if (tries > 6000 || ! flush.isThreadRunning()) { error = TRANS ("Write failed (disk full?)"); return false; }
+                Thread::sleep (1);
+            }
+        }
+
+        // closes the streaming file (flushing what is buffered) resp. writes the fallback
+        // buffer through the normal path; returns false with 'error' set on failure
+        bool finish()
+        {
+            if (threaded != nullptr)
+            {
+                threaded.reset();
+                if (! file.existsAsFile() || file.getSize() < 44)
+                {
+                    error = TRANS ("Write failed (disk full?)");
+                    return false;
+                }
+                return true;
+            }
+            if (acc.getNumSamples() <= 0) { error = TRANS ("Unsupported export format"); return false; }
+            return writeAudioFile (file, acc, rate, depth, normalize, error, format, mp3Kbps);
+        }
+
+        File file;
+        TimeSliceThread& flush;
+        double rate = 44100.0;
+        int depth = 24, mp3Kbps = 320;
+        ExportOptions::Format format = ExportOptions::Wav;
+        bool normalize = false;
+        String& error;
+        std::unique_ptr<AudioFormatWriter::ThreadedWriter> threaded;
+        AudioBuffer<float> acc;
+        int64 written = 0;
+        Random rnd;
+    };
+}
+
+bool Engine::beginOfflineRender (const std::vector<int>& trackIds)
+{
+    bool expected = false;
+    if (! exporting.compare_exchange_strong (expected, true))
+        return false;   // another offline render (export / freeze) is already running
+
+    deviceManager.removeAudioCallback (this);
+
+    // only the plug-ins that actually process during this render are switched over: preparing a
+    // whole big session twice per freeze is what made instrument freezes feel slow
+    const double sr = sampleRate > 0 ? sampleRate : 44100.0;
+    constexpr int block = TrackRuntime::kMaxBlock;   // offline: bigger blocks amortize the per-block overhead
+    // When the render runs at the device rate the plug-ins are already prepared for a block size
+    // of at least kMaxBlock (createInstanceImpl / resyncAraDocuments always prepare for
+    // jmax(deviceBlock, kMaxBlock)); processing kMaxBlock blocks on that preparation is exactly
+    // what the audio thread does, so no releaseResources / prepareToPlay is needed at all.
+    offlineRestorePrepare = std::abs (sr - sampleRate) > 0.5;
+    offlinePreparedUids.clear();
+    for (int id : trackIds)
+        if (auto* t = project.findTrack (id))
+        {
+            if (t->hasInstrument) offlinePreparedUids.insert (t->instrument.uid);
+            for (auto& s : t->extraInstruments) offlinePreparedUids.insert (s.uid);
+            for (auto& s : t->inserts) offlinePreparedUids.insert (s.uid);
+        }
+
+    for (auto uid : offlinePreparedUids)
+        if (auto inst = getInstance (uid))
+        {
+            auto& p = *inst->proc;
+            if (offlineRestorePrepare)
+            {
+                p.releaseResources();
+                p.setNonRealtime (true);
+                p.setRateAndBufferSizeDetails (sr, block);
+                p.prepareToPlay (sr, block);
+                int lat = 0;
+                try { lat = jmax (0, p.getLatencySamples()); } catch (...) {}
+                inst->latencySamples.store (lat);
+            }
+            else
+            {
+                p.setNonRealtime (true);
+            }
+        }
+    return true;
+}
+
+void Engine::endOfflineRender()
+{
+    bool expected = true;
+    if (! exporting.compare_exchange_strong (expected, false))
+        return;
+
+    for (auto uid : offlinePreparedUids)
+        if (auto inst = getInstance (uid))
+        {
+            auto& p = *inst->proc;
+            if (offlineRestorePrepare)
+            {
+                p.releaseResources();
+                p.setNonRealtime (false);
+                p.setRateAndBufferSizeDetails (sampleRate, TrackRuntime::kMaxBlock);
+                p.prepareToPlay (sampleRate, TrackRuntime::kMaxBlock);
+                int lat = 0;
+                try { lat = jmax (0, p.getLatencySamples()); } catch (...) {}
+                inst->latencySamples.store (lat);
+            }
+            else
+            {
+                p.setNonRealtime (false);
+            }
+        }
+    offlinePreparedUids.clear();
+    offlineRestorePrepare = false;
+
+    // The plug-ins are already in their realtime state (either never changed or restored above):
+    // re-attaching the device callback must not re-prepare the whole project again.
+    if (deviceManager.getCurrentAudioDevice() != nullptr)
+        skipNextDevicePrepare.store (true);
+    deviceManager.addAudioCallback (this);
+    // publish whatever arrived while the render thread was reading the model
+    if (deferredStructure.exchange (false)) { reconcilePlugins(); ensureRuntimes(); }
+    syncMixToRuntimes();
+    if (deferredAsyncUpdate.exchange (false)) triggerAsyncUpdate();
+}
+
+bool Engine::renderTrackRangeToFilePrepared (int trackId, double startBeat, double endBeat, const File& file,
+                                             String& error, bool flatFader, bool noPdcPad, bool bypassInserts,
+                                             const std::function<bool (double)>& progress,
+                                             std::shared_ptr<Snap>& snap)
+{
+    const ScopedLock sl (exportLock);
+    if (project.findTrack (trackId) == nullptr || project.tracks.empty()) { error = TRANS ("Nothing to export."); return false; }
+
+    const double sr = sampleRate > 0 ? sampleRate : 44100.0;
+    if (endBeat <= startBeat + 1.0e-6) { error = TRANS ("Nothing to export."); return false; }
+
+    constexpr int block = TrackRuntime::kMaxBlock;   // offline: bigger blocks amortize the per-block overhead
+    // The snapshot is built once for a whole freeze (parent + every output channel); building it
+    // per channel converted all MIDI events of the project again for each one.
+    if (snap == nullptr) snap = buildSnapshot();
+
+    const int64 startSample = project.beatToSamples (startBeat, sr);
+    const int64 total = jmax<int64> (1, project.beatToSamples (endBeat, sr) - startSample);
+
+    // start from a clean fx state
+    for (auto& [uid, inst] : instances) inst->proc->reset();
+    for (auto& ts : snap->tracks) { ts.rt->lastGainL = ts.rt->lastGainR = -1.0f; ts.rt->resetDelay(); }
+    std::fill (masterDelayLine.begin(), masterDelayLine.end(), 0.0f);
+    masterDelayWrite = 0;
+    masterPadApplied = -1;
+    masterPadFade = 0;
+    std::fill (metroDelayLine.begin(), metroDelayLine.end(), 0.0f);
+    metroDelayWrite = 0;
+    metroPadApplied = -1;
+    metroPadFade = 0;
+    lastMasterGain = -1.0f;
+    lastMasterPhase = false;
+    lastListenGain = -1.0f;
+    flushNotes = false;
+
+    RenderCtx ctx;
+    ctx.realtime = false;
+    ctx.allowLoop = false;
+    ctx.onlyTrack = trackId;
+    // an output channel of a multi-output instrument: render its source instrument track as the
+    // input, but only print the channel itself
+    if (auto* frozenTrack = project.findTrack (trackId))
+        if (frozenTrack->sourceTrack != 0)
+            ctx.onlyTrackSource = frozenTrack->sourceTrack;
+    ctx.masterFx = false;
+    ctx.ignoreMuteSolo = true;
+    ctx.sampleRate = sr;
+    ctx.flatFader = flatFader;
+    ctx.noPdcPad = noPdcPad;
+    ctx.bypassInserts = bypassInserts;
+
+    // The render streams straight into the WAV file (background thread flushes each block), so
+    // the finished audio is never held in memory as a whole and the disk work overlaps the
+    // plug-in rendering. The sink owns the file until it is destroyed, so a cancelled render
+    // deletes the file only after it has been closed.
+    file.getParentDirectory().createDirectory();
+    bool ok = true;
+    {
+        OfflineSink sink (file, writerThread, sr, 24, ExportOptions::Wav, 320, false, error);
+        sink.start (2);
+        AudioBuffer<float> chunk (2, block);
+        int64 pos = startSample;
+        for (int64 done = 0; done < total;)
+        {
+            const int n = (int) jmin<int64> (block, total - done);
+            renderChunk (*snap, ctx, pos, true, n, chunk, nullptr, nullptr, 0);
+            sink.condition (chunk, n);
+            if (! sink.write (chunk, n, done, 0)) { ok = false; break; }
+            done += n;
+            if (progress && ! progress ((double) done / (double) total))
+            {
+                // a cancelled render never touches the message thread: the caller ends the session
+                ok = false;
+                if (error.isEmpty()) error = TRANS ("Export cancelled.");
+                break;
+            }
+        }
+        if (ok) ok = sink.finish();
+    }
+
+    if (! ok)
+    {
+        file.deleteFile();
+        for (auto& [uid, inst] : instances) inst->proc->reset();
+        for (auto& ts : snap->tracks) { ts.rt->lastGainL = ts.rt->lastGainR = -1.0f; }
+        lastMasterGain = -1.0f;
+        lastMasterPhase = false;
+        lastListenGain = -1.0f;
+        return false;
+    }
+
+    for (auto& [uid, inst] : instances) inst->proc->reset();
+    for (auto& ts : snap->tracks) { ts.rt->lastGainL = ts.rt->lastGainR = -1.0f; }
+    lastMasterGain = -1.0f;
+    lastMasterPhase = false;
+    lastListenGain = -1.0f;
+    return true;
+}
+
+bool Engine::renderTracksRangeToFilesPrepared (const std::vector<int>& trackIds, double startBeat, double endBeat,
+                                               const std::vector<File>& files, String& error,
+                                               bool flatFader, bool noPdcPad, bool bypassInserts,
+                                               const std::function<bool (double)>& progress,
+                                               std::shared_ptr<Snap>& snap)
+{
+    const ScopedLock sl (exportLock);
+    if (trackIds.empty() || trackIds.size() != files.size() || project.tracks.empty())
+        { error = TRANS ("Nothing to export."); return false; }
+
+    const double sr = sampleRate > 0 ? sampleRate : 44100.0;
+    if (endBeat <= startBeat + 1.0e-6) { error = TRANS ("Nothing to export."); return false; }
+
+    // every printed track plus the source instrument tracks its channels need as input
+    std::vector<int> renderIds;
+    auto addId = [&renderIds] (int id)
+    {
+        if (id == 0) return;
+        if (std::find (renderIds.begin(), renderIds.end(), id) == renderIds.end()) renderIds.push_back (id);
+    };
+    for (int id : trackIds)
+    {
+        addId (id);
+        if (auto* t = project.findTrack (id)) addId (t->sourceTrack);
+    }
+
+    constexpr int block = TrackRuntime::kMaxBlock;   // offline: bigger blocks amortize the per-block overhead
+    // the snapshot is built once for the whole freeze and reused (see renderTrackRangeToFilePrepared)
+    if (snap == nullptr) snap = buildSnapshot();
+
+    // resolve each printed track to its runtime in the snapshot (exactly the buffers the render
+    // below writes); a missing track is a caller bug but must not crash
+    std::vector<TrackRuntime*> printRts;
+    for (int id : trackIds)
+    {
+        TrackRuntime* found = nullptr;
+        for (auto& ts : snap->tracks)
+            if (ts.rt->trackId == id) { found = ts.rt.get(); break; }
+        if (found == nullptr) { error = TRANS ("Nothing to export."); return false; }
+        printRts.push_back (found);
+    }
+
+    const int64 startSample = project.beatToSamples (startBeat, sr);
+    const int64 total = jmax<int64> (1, project.beatToSamples (endBeat, sr) - startSample);
+
+    // start from a clean fx state
+    for (auto& [uid, inst] : instances) inst->proc->reset();
+    for (auto& ts : snap->tracks) { ts.rt->lastGainL = ts.rt->lastGainR = -1.0f; ts.rt->resetDelay(); }
+    std::fill (masterDelayLine.begin(), masterDelayLine.end(), 0.0f);
+    masterDelayWrite = 0;
+    masterPadApplied = -1;
+    masterPadFade = 0;
+    std::fill (metroDelayLine.begin(), metroDelayLine.end(), 0.0f);
+    metroDelayWrite = 0;
+    metroPadApplied = -1;
+    metroPadFade = 0;
+    lastMasterGain = -1.0f;
+    lastMasterPhase = false;
+    lastListenGain = -1.0f;
+    flushNotes = false;
+
+    RenderCtx ctx;
+    ctx.realtime = false;
+    ctx.allowLoop = false;
+    ctx.onlyTrack = -1;          // multi-target: renderIds / printIds steer the render instead
+    ctx.renderIds = &renderIds;
+    ctx.printIds = &trackIds;
+    ctx.masterFx = false;
+    ctx.ignoreMuteSolo = true;
+    ctx.sampleRate = sr;
+    ctx.flatFader = flatFader;
+    ctx.noPdcPad = noPdcPad;
+    ctx.bypassInserts = bypassInserts;
+
+    // one streaming sink per target file; the render passes once and each block is fanned out
+    // into the sinks right after it (the old freeze re-rendered the shared instrument once per
+    // output channel, which made a multi-output freeze C+1 times as slow)
+    for (auto& f : files) f.getParentDirectory().createDirectory();
+    bool ok = true;
+    {
+        std::vector<std::unique_ptr<OfflineSink>> sinks;
+        for (auto& f : files)
+        {
+            sinks.push_back (std::make_unique<OfflineSink> (f, writerThread, sr, 24, ExportOptions::Wav, 320, false, error));
+            sinks.back()->start (2);
+        }
+
+        AudioBuffer<float> chunk (2, block);
+        int64 pos = startSample;
+        for (int64 done = 0; ok && done < total;)
+        {
+            const int n = (int) jmin<int64> (block, total - done);
+            renderChunk (*snap, ctx, pos, true, n, chunk, nullptr, nullptr, 0);
+            for (size_t i = 0; i < printRts.size(); ++i)
+            {
+                // "no effects" freezes print the pre-insert tap; otherwise the finished buffer
+                auto& buf = bypassInserts ? printRts[i]->preBuf : printRts[i]->buf;
+                sinks[i]->condition (buf, n);
+                if (! sinks[i]->write (buf, n, done, 0)) { ok = false; break; }
+            }
+            if (! ok) break;
+            done += n;
+            if (progress && ! progress ((double) done / (double) total))
+            {
+                // a cancelled render never touches the message thread: the caller ends the session
+                ok = false;
+                if (error.isEmpty()) error = TRANS ("Export cancelled.");
+                break;
+            }
+        }
+        if (ok)
+            for (auto& s2 : sinks)
+                if (! s2->finish()) { ok = false; break; }
+
+        // sinks are destroyed (files closed) before anything is deleted
+        sinks.clear();
+    }
+
+    if (! ok)
+    {
+        for (auto& f : files) f.deleteFile();
+        for (auto& [uid, inst] : instances) inst->proc->reset();
+        for (auto& ts : snap->tracks) { ts.rt->lastGainL = ts.rt->lastGainR = -1.0f; }
+        lastMasterGain = -1.0f;
+        lastMasterPhase = false;
+        lastListenGain = -1.0f;
+        return false;
+    }
+
+    for (auto& [uid, inst] : instances) inst->proc->reset();
+    for (auto& ts : snap->tracks) { ts.rt->lastGainL = ts.rt->lastGainR = -1.0f; }
+    lastMasterGain = -1.0f;
+    lastMasterPhase = false;
+    lastListenGain = -1.0f;
+    return true;
+}
+
+bool Engine::renderTrackRangeToFile (int trackId, double startBeat, double endBeat, const File& file,
+                                     String& error, bool flatFader, bool noPdcPad, bool bypassInserts,
+                                     const std::function<bool (double)>& progress)
+{
+    std::vector<int> ids { trackId };
+    if (auto* t = project.findTrack (trackId))
+        if (t->sourceTrack != 0) ids.push_back (t->sourceTrack);
+    if (! beginOfflineRender (ids)) { error = TRANS ("Nothing to export."); return false; }
+
+    struct Restore
+    {
+        Engine& e;
+        ~Restore() { e.endOfflineRender(); }
+    } restore { *this };
+
+    std::shared_ptr<Snap> snap;
+    return renderTrackRangeToFilePrepared (trackId, startBeat, endBeat, file, error, flatFader, noPdcPad,
+                                           bypassInserts, progress, snap);
+}
+
+bool Engine::exportAudio (const ExportOptions& o, const std::function<bool (double)>& progress, String& error)
+{
+    // Studio One style real-time mixdown: runs through the audio device (and takes as long as the
+    // song), which some plug-ins need in order to sound exactly like they do during playback.
+    if (o.realtime && o.mode == ExportOptions::Mix)
+        return exportAudioRealtime (o, progress, error);
+
+    // Never block the export thread on another render: a stuck previous export used to make the
+    // next "Export" click look like nothing happened. Report it instead.
+    const ScopedTryLock sl (exportLock);
+    if (! sl.isLocked()) { error = TRANS ("Another export or render is already running."); return false; }
+    if (project.tracks.empty()) { error = TRANS ("The project is empty."); return false; }
+
+    const double sr = o.sampleRate;
+    const double startBeat = o.useLoopRange ? project.loopStart : 0.0;
+    const double endBeatVal = o.useLoopRange ? project.loopEnd : project.endBeat();
+    if (endBeatVal <= startBeat + 1.0e-6) { error = TRANS ("Nothing to export."); return false; }
+
+    auto onMessageThread = [] (std::function<void()> fn)
+    {
+        if (MessageManager::getInstance()->isThisTheMessageThread()) { fn(); return; }
+        MessageManager::getInstance()->callFunctionOnMessageThread ([] (void* p) -> void*
+        {
+            (*static_cast<std::function<void()>*> (p)) ();
+            return nullptr;
+        }, &fn);
+    };
+
+    constexpr int block = TrackRuntime::kMaxBlock;   // offline: bigger blocks amortize the per-block overhead
+    // If the export rate equals the device rate the plug-ins are already prepared for blocks of
+    // up to TrackRuntime::kMaxBlock, so the offline render can reuse that preparation. Preparing a
+    // whole big session (three times: before, after and when the callback returns) was the main
+    // reason exports felt slow.
+    const bool needPrepare = std::abs (sr - sampleRate) > 0.5;
+    // Claim the render before touching the device / plug-ins. beginOfflineRender (freeze) uses the
+    // same flag, so an export and a freeze can never run at the same time.
+    bool expected = false;
+    if (! exporting.compare_exchange_strong (expected, true))
+    {
+        error = TRANS ("Another export or render is already running.");
+        return false;
+    }
+    onMessageThread ([&]
+    {
+        deviceManager.removeAudioCallback (this);
+        if (needPrepare)
+            prepareAll (sr, block, true);
+        else
+            for (auto& [uid, inst] : instances) inst->proc->setNonRealtime (true);
+    });
+
+    struct Restore
+    {
+        Engine& e;
+        bool needPrepare = false;
+        std::function<void (std::function<void()>)> run;
+        ~Restore()
+        {
+            e.exporting.store (false);
+            run ([this]
+            {
+                if (needPrepare)
+                    e.prepareAll (e.sampleRate, TrackRuntime::kMaxBlock, false);
+                else
+                    for (auto& [uid, inst] : e.instances) inst->proc->setNonRealtime (false);
+                // the plug-ins are in their realtime state already: no full re-prepare on re-attach
+                if (e.deviceManager.getCurrentAudioDevice() != nullptr)
+                    e.skipNextDevicePrepare.store (true);
+                e.deviceManager.addAudioCallback (&e);
+                if (e.deferredStructure.exchange (false)) { e.reconcilePlugins(); e.ensureRuntimes(); }
+                e.syncMixToRuntimes();
+                if (e.deferredAsyncUpdate.exchange (false)) e.triggerAsyncUpdate();
+            });
+        }
+    } restore { *this, needPrepare, onMessageThread };
+
+    auto snap = buildSnapshot();
+    const int64 startSample = project.beatToSamples (startBeat, sr);
+    const int64 body = jmax<int64> (1, project.beatToSamples (endBeatVal, sr) - startSample);
+    const int64 total = body + (int64) (o.tailSeconds * sr);
+
+    auto resetAll = [&]
+    {
+        for (auto& [uid, inst] : instances) inst->proc->reset();
+        for (auto& ts : snap->tracks)
+        {
+            ts.rt->lastGainL = ts.rt->lastGainR = -1.0f;
+            ts.rt->resetDelay();
+        }
+        std::fill (masterDelayLine.begin(), masterDelayLine.end(), 0.0f);
+        masterDelayWrite = 0;
+        masterPadApplied = -1;
+        masterPadFade = 0;
+        std::fill (metroDelayLine.begin(), metroDelayLine.end(), 0.0f);
+        metroDelayWrite = 0;
+        metroPadApplied = -1;
+        metroPadFade = 0;
+        lastMasterGain = -1.0f;
+    lastMasterPhase = false;
+    lastListenGain = -1.0f;
+    };
+
+    bool ok = true;
+
+    // The render is delayed by the plug-in latency of the signal path (that is what delay
+    // compensation does: the tracks are padded so they line up with each other). A printed mix
+    // has to land on the timeline again, so `lead` samples of the render are dropped - the file
+    // then starts exactly at the first sample of the exported range.
+    auto leadOf = [&] (const RenderCtx& ctx) -> int
+    {
+        if (ctx.onlyTrack < 0)
+            return snap->maxPdc;                       // whole mix: every track is delayed by this
+
+        for (auto& ts : snap->tracks)
+            if (ts.rt->trackId == ctx.onlyTrack)
+            {
+                const int selDelay = (ts.ownPdc - ts.fillPdc) + ts.pad;
+                return jlimit (0, TrackRuntime::kPdcCap - 1,
+                               selDelay + (ctx.masterFx ? snap->masterPdc : 0));
+            }
+        return 0;
+    };
+
+    auto renderPass = [&] (const RenderCtx& ctx, OfflineSink& sink, int lead,
+                           double progLo, double progHi) -> bool
+    {
+        resetAll();
+        const int64 renderLen = total + (int64) lead;
+        AudioBuffer<float> chunk (2, block);
+        int64 pos = startSample;
+        for (int64 done = 0; done < renderLen;)
+        {
+            const int n = (int) jmin<int64> (block, renderLen - done);
+            renderChunk (*snap, ctx, pos, true, n, chunk, nullptr, nullptr, 0);
+            sink.condition (chunk, n);
+            if (! sink.write (chunk, n, done, lead)) return false;
+            done += n;
+            if (progress && ! progress (progLo + (progHi - progLo) * (double) done / (double) renderLen))
+                return false;
+        }
+        return sink.finish();
+    };
+
+    // WAV tempo metadata: the tempo at the start of the exported range and its length in beats
+    const double tempoStartBeat = o.useLoopRange ? project.loopStart : 0.0;
+    const double tempoBpm = project.bpmAt (tempoStartBeat);
+    const double tempoBeats = jmax (1.0, o.useLoopRange ? (project.loopEnd - project.loopStart)
+                                                        : (project.endBeat() - tempoStartBeat));
+    auto stampTempo = [&] (const File& f)
+    {
+        if (o.writeTempo && o.format == ExportOptions::Wav) writeWavTempo (f, tempoBpm, tempoBeats);
+    };
+
+    RenderCtx base;
+    base.realtime = false;
+    base.allowLoop = false;
+    base.sampleRate = sr;
+    base.masterFx = true;
+    flushNotes = false;
+
+    if (o.mode == ExportOptions::Mix)
+    {
+        auto target = o.target;
+        const auto ext = extensionFor (o.format);
+        if (! target.hasFileExtension (ext.substring (1))) target = target.withFileExtension (ext);
+
+        const int lead = leadOf (base);
+        bool passOk = false;
+        {
+            // the sink owns the file until it is destroyed: close it before deleting a failed render
+            OfflineSink sink (target, writerThread, sr, o.bitDepth, o.format, o.mp3Bitrate, o.normalize, error);
+            sink.start (2);
+            passOk = renderPass (base, sink, lead, 0.0, 0.95);
+        }
+        if (! passOk)
+        {
+            ok = false;
+            if (error.isEmpty()) error = TRANS ("Export cancelled.");
+            target.deleteFile();
+        }
+        else
+            stampTempo (target);
+    }
+    else
+    {
+        // Stems: every track with content, plus the output channels of multi-output instruments
+        // (a channel has no clips of its own - it plays a pair of its parent's plug-in outputs -
+        // but it is a real mixer channel and can be exported on its own).
+        std::vector<Track*> list;
+        for (auto& t : project.tracks)
+        {
+            const bool hasContent = ! t->midiClips.empty() || ! t->audioClips.empty();
+            if (! hasContent && t->sourceTrack == 0) continue;
+            if (! o.includeTracks.empty() && o.includeTracks.count (t->id) == 0) continue;
+            list.push_back (t.get());
+        }
+        if (list.empty()) { error = TRANS ("No tracks with content to export."); ok = false; }
+
+        o.target.createDirectory();
+        int idx = 0;
+        for (auto* t : list)
+        {
+            if (! ok) break;
+            RenderCtx c = base;
+            c.onlyTrack = t->id;
+            if (t->sourceTrack != 0) c.onlyTrackSource = t->sourceTrack;
+            c.ignoreMuteSolo = true;
+            c.masterFx = o.stemsWithMasterFx;
+            const double lo = (double) idx / (double) list.size(), hi = (double) (idx + 1) / (double) list.size();
+
+            // a channel stem names the instrument it belongs to, so the file list reads in order
+            String stemName = t->name;
+            if (t->sourceTrack != 0)
+                if (auto* parent = project.findTrack (t->sourceTrack))
+                    if (! stemName.startsWithIgnoreCase (parent->name))
+                        stemName = parent->name + " - " + stemName;
+            auto name = String (idx + 1).paddedLeft ('0', 2) + " " + File::createLegalFileName (stemName);
+            const auto stemFile = o.target.getChildFile (name + extensionFor (o.format));
+
+            const int lead = leadOf (c);
+            bool passOk = false;
+            {
+                // the sink owns the file until it is destroyed: close it before deleting a failed render
+                OfflineSink sink (stemFile, writerThread, sr, o.bitDepth, o.format, o.mp3Bitrate, o.normalize, error);
+                sink.start (2);
+                passOk = renderPass (c, sink, lead, lo, hi * 0.98);
+            }
+            if (! passOk)
+            {
+                ok = false;
+                if (error.isEmpty()) error = TRANS ("Export cancelled.");
+                stemFile.deleteFile();
+                break;
+            }
+            stampTempo (stemFile);
+            ++idx;
+        }
+    }
+
+    for (auto& [uid, inst] : instances) inst->proc->reset();
+    for (auto& ts : snap->tracks) { ts.rt->lastGainL = ts.rt->lastGainR = -1.0f; }
+    lastMasterGain = -1.0f;
+    lastMasterPhase = false;
+    lastListenGain = -1.0f;
+    if (progress) progress (1.0);
+    return ok;
+}
+
+//==============================================================================
+void Engine::RealtimeCaptureState::prepare (int64 samples)
+{
+    const SpinLock::ScopedLockType sl (lock);
+    buffer = std::make_shared<AudioBuffer<float>> (2, (int) jmax<int64> (1, samples));
+    finished.reset();
+    total = jmax<int64> (1, samples);
+    pos.store (0, std::memory_order_relaxed);
+    done.store (false, std::memory_order_relaxed);
+    active.store (true, std::memory_order_release);
+}
+
+void Engine::RealtimeCaptureState::finish()
+{
+    const SpinLock::ScopedLockType sl (lock);
+    active.store (false, std::memory_order_release);
+    finished = buffer;
+    buffer.reset();
+}
+
+bool Engine::exportAudioRealtime (const ExportOptions& o, const std::function<bool (double)>& progress, String& error)
+{
+    const ScopedTryLock sl (exportLock);
+    if (! sl.isLocked()) { error = TRANS ("Another export or render is already running."); return false; }
+    if (project.tracks.empty()) { error = TRANS ("The project is empty."); return false; }
+    if (isRecording()) { error = TRANS ("Stop recording before rendering in real time."); return false; }
+
+    ensureDeviceOpen();                  // this export runs through the device: it must be open
+
+    auto onMessageThread = [] (std::function<void()> fn)
+    {
+        if (MessageManager::getInstance()->isThisTheMessageThread()) { fn(); return; }
+        MessageManager::getInstance()->callFunctionOnMessageThread ([] (void* p) -> void*
+        {
+            (*static_cast<std::function<void()>*> (p)) ();
+            return nullptr;
+        }, &fn);
+    };
+
+    const double startBeat = o.useLoopRange ? project.loopStart : 0.0;
+    const double endBeat = o.useLoopRange ? project.loopEnd : project.endBeat();
+    if (endBeat <= startBeat + 1.0e-6) { error = TRANS ("Nothing to export."); return false; }
+
+    bool started = false;
+    int64 total = 0;
+    double rtRate = 44100.0;
+    bool expected = false;
+    if (! exporting.compare_exchange_strong (expected, true))
+    {
+        error = TRANS ("Another export or render is already running.");
+        return false;
+    }
+    onMessageThread ([&]
+    {
+        auto* dev = deviceManager.getCurrentAudioDevice();
+        if (dev == nullptr) return;
+        rtRate = jmax (1.0, dev->getCurrentSampleRate());
+        const int64 startSample = project.beatToSamples (startBeat, rtRate);
+        total = jmax<int64> (1, project.beatToSamples (endBeat, rtRate) - startSample)
+                + (int64) (o.tailSeconds * rtRate);
+        // the model must not change while the transport performs the render
+        rtCapture.prepare (total);
+        setPositionBeats (startBeat);
+        play();
+        trace ("realtime export: rate " + String (rtRate) + ", total " + String (total) + " samples, device "
+               + (dev->getName()) + ", block " + String (dev->getCurrentBufferSizeSamples()));
+        started = true;
+    });
+    if (! started)
+    {
+        exporting.store (false);
+        error = TRANS ("Real-time rendering needs an active audio device.");
+        return false;
+    }
+
+    const auto began = Time::getMillisecondCounter();
+    const auto deadline = began
+                        + (uint32) ((double) total / jmax (1.0, rtRate) * 1000.0) + 120000;
+    bool cancelled = false;
+    int spins = 0;
+    for (;;)
+    {
+        if (rtCapture.done.load (std::memory_order_acquire)) break;
+        if ((++spins % 100) == 0)
+            trace ("realtime export: pos " + String (rtCapture.pos.load()) + " / " + String (total)
+                   + ", playing " + String ((int) isPlaying()));
+        if (progress)
+        {
+            const double p = jlimit (0.0, 0.99, (double) rtCapture.pos.load (std::memory_order_acquire)
+                                               / (double) jmax<int64> (1, total));
+            if (! progress (p)) { cancelled = true; break; }
+        }
+        if (Time::getMillisecondCounter() > deadline)
+        {
+            error = TRANS ("Real-time rendering timed out.");
+            cancelled = true;
+            break;
+        }
+        Thread::sleep (10);
+    }
+
+    trace ("realtime export: capture loop done at " + String (Time::getMillisecondCounter() - began) + " ms");
+    onMessageThread ([this]
+    {
+        stop();
+        rtCapture.finish();
+        exporting.store (false);
+        if (deferredStructure.exchange (false)) { reconcilePlugins(); ensureRuntimes(); }
+        syncMixToRuntimes();
+        if (deferredAsyncUpdate.exchange (false)) triggerAsyncUpdate();
+    });
+    trace ("realtime export: finalize done at " + String (Time::getMillisecondCounter() - began) + " ms");
+
+    if (cancelled)
+    {
+        if (error.isEmpty()) error = TRANS ("Export cancelled.");
+        return false;
+    }
+
+    auto captured = rtCapture.finished;
+    if (captured == nullptr || captured->getNumSamples() <= 0)
+    {
+        error = TRANS ("Real-time rendering produced no audio.");
+        return false;
+    }
+
+    // the captured master output carries the same PDC lead-in as an offline render
+    const int lead = jlimit (0, jmax (0, captured->getNumSamples() - 1), (int) pdcTotalSamples.load());
+    AudioBuffer<float> result (captured->getArrayOfWritePointers(), 2, lead, captured->getNumSamples() - lead);
+
+    auto target = o.target;
+    const auto ext = extensionFor (o.format);
+    if (! target.hasFileExtension (ext.substring (1))) target = target.withFileExtension (ext);
+    bool ok = writeAudioFile (target, result, rtRate, o.bitDepth, o.normalize, error, o.format, o.mp3Bitrate);
+    trace ("realtime export: file written at " + String (Time::getMillisecondCounter() - began) + " ms");
+    if (ok && o.writeTempo && o.format == ExportOptions::Wav)
+        writeWavTempo (target, project.bpmAt (startBeat), jmax (1.0, endBeat - startBeat));
+    if (progress) progress (1.0);
+    return ok;
+}
+}

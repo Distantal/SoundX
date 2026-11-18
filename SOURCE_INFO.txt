@@ -1,0 +1,29 @@
+﻿SoundX 0.07Beta Source Code
+============================
+Version: 0.07Beta
+Generated: 2026-11-18
+Platform: Windows (JUCE 8 / C++20)
+
+Contents
+--------
+  src/              SoundX application source
+  installer/        Windows installer source
+  docs/             documentation and manual
+  third_party/      JUCE, VST2, ARA SDK and ASIO SDK sources
+  CMakeLists.txt    CMake project
+  build.ps1         Windows build script
+  package.ps1       Windows packaging script
+  package-mac.sh    macOS packaging helper
+  README.md         project documentation
+
+Build (Windows)
+---------------
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+  Output: build\SoundX_artefacts\Release\SoundX.exe
+
+Requirements
+------------
+  Visual Studio 2022 (MSVC x64), CMake, Windows 10/11 SDK.
+  third_party/JUCE/.git and most JUCE examples were omitted from this archive
+  to keep it small; the JUCE CMake support files and the ARA demo header remain.
+

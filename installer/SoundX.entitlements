@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      SoundX is a plug-in host: it loads VST3 bundles that are signed by their own developers.
+      With the hardened runtime enabled (which a distributable / notarised build needs) macOS
+      "library validation" refuses to load any bundle that is not signed by Apple or by the same
+      team as this app - so without this entitlement every third-party plug-in fails with
+      "Unable to load VST-3 plug-in file" and the scanner reports no types for every file.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Some plug-ins generate code at run time (scripting, modular / Max-style editors). -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Recording an audio track needs the microphone (paired with the NSMicrophoneUsageDescription
+         CMake adds to the Info.plist). -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
